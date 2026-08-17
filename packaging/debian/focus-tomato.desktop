@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Tomato
+Name[zh_CN]=专注番茄钟
+Comment=A quiet Pomodoro timer in the system panel
+Comment[zh_CN]=安静地驻留在系统顶栏的番茄钟
+Exec=/usr/bin/focus-tomato
+Icon=/usr/share/focus-tomato/icons/focus-tomato-idle-symbolic.svg
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-UsesNotifications=true

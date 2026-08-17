@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Focus Tomato
+Name[zh_CN]=专注番茄钟
+Exec=/usr/bin/focus-tomato --autostart
+Icon=/usr/share/focus-tomato/icons/focus-tomato-idle-symbolic.svg
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <circle cx="8" cy="8" r="5.5" fill="none" stroke="#77767b" stroke-opacity=".38" stroke-width="2"/>
+  <circle cx="8" cy="8" r="5.5" fill="none" stroke="#5f9d70" stroke-width="2" stroke-linecap="round" pathLength="100" stroke-dasharray="62.5 100" transform="rotate(-90 8 8)"/>
+  <circle cx="8" cy="8" r="2.1" fill="#5f9d70"/>
+</svg>

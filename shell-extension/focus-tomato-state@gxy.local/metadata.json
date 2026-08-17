@@ -1,0 +1,7 @@
+{
+  "uuid": "focus-tomato-state@gxy.local",
+  "name": "Focus Tomato State Band",
+  "description": "Shows a quiet three-pixel focus state band on GNOME Shell 42.",
+  "shell-version": ["42"],
+  "version": 2
+}

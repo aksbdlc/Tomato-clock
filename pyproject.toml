@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "focus-tomato"
+version = "0.3.0"
+description = "A quiet GNOME panel Pomodoro timer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Focus Tomato Contributors" }]
+dependencies = [
+  "tomli>=1.1.0; python_version < '3.11'",
+]
+
+[project.scripts]
+focus-tomato = "focus_tomato.app:main"
+
+[tool.setuptools.packages.find]
+include = ["focus_tomato*"]

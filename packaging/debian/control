@@ -1,0 +1,11 @@
+Package: focus-tomato
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: all
+Maintainer: Focus Tomato Contributors <noreply@example.invalid>
+Depends: python3, python3-gi, gir1.2-gtk-3.0, gir1.2-notify-0.7, gir1.2-ayatanaappindicator3-0.1, python3-tomli
+Recommends: gnome-shell (>= 42), gnome-shell (<< 43)
+Description: quiet GNOME panel Pomodoro timer
+ Focus Tomato is a lightweight Pomodoro timer that stays in the GNOME panel,
+ sends silent desktop notifications, and stores simple daily focus totals.

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd -- "${script_dir}/.." && pwd)"
+
+if [[ "${1-}" == "--autostart" ]]; then
+    shift
+    config_file="${XDG_CONFIG_HOME:-${HOME}/.config}/focus-tomato/config.toml"
+    if [[ -f "${config_file}" ]] && grep -Eq \
+        '^[[:space:]]*autostart[[:space:]]*=[[:space:]]*false([[:space:]]*(#.*)?)?$' \
+        "${config_file}"; then
+        exit 0
+    fi
+fi
+
+export FOCUS_TOMATO_ICON_DIR="${FOCUS_TOMATO_ICON_DIR:-${project_dir}/assets/icons}"
+export FOCUS_TOMATO_EXECUTABLE="${FOCUS_TOMATO_EXECUTABLE:-${script_dir}/focus-tomato}"
+export PYTHONPATH="${project_dir}${PYTHONPATH:+:${PYTHONPATH}}"
+
+exec python3 -m focus_tomato "$@"

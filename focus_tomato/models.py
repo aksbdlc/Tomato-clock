@@ -45,6 +45,11 @@ class RuntimeSnapshot:
     # computer sleeps and after the process restarts.  Focus deliberately
     # does not use this field: it is still driven by a monotonic clock.
     break_deadline_wall_ms: int | None = None
+    # The wall-clock instant at which the current focus phase began.  It is
+    # persisted solely to evaluate the rolling qualified-focus window across
+    # application restarts; remaining focus time remains monotonic-clock
+    # driven.
+    focus_started_at_wall_ms: int | None = None
 
 
 @dataclass(frozen=True)

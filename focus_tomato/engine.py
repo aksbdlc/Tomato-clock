@@ -16,7 +16,11 @@ from .storage import SQLiteStore
 from .time_utils import local_day, split_duration_by_local_day
 
 
-EARLY_END_MINIMUM_FOCUS_MS = 60_000
+# A focus must reach five active minutes before it becomes part of the user's
+# record.  This deliberately applies to both naturally completed and manually
+# ended focuses.  Paused time does not count.
+MINIMUM_RECORDED_FOCUS_MS = 5 * 60_000
+CONTINUOUS_FOCUS_WINDOW_MS = 3 * 60 * 60_000
 
 
 class TimerEngine:
@@ -40,6 +44,16 @@ class TimerEngine:
             int,
             store.load_current_focus_pending(),
         )
+        self._recent_cycle_focus_starts = list(store.load_cycle_focus_starts())
+        self._trim_cycle_focus_history()
+        # Older releases only persisted a count.  It provides no evidence for
+        # the three-hour continuity rule, so never let it contribute to a new
+        # long-break decision after upgrading.
+        needs_cycle_migration = (
+            self._snapshot.completed_in_cycle
+            != len(self._recent_cycle_focus_starts)
+        )
+        self._snapshot.completed_in_cycle = len(self._recent_cycle_focus_starts)
         self._anchor_monotonic_ms = now_monotonic_ms
         self._anchor_wall_ms = now_wall_ms
         self.recovered = False
@@ -55,10 +69,12 @@ class TimerEngine:
             # A break intentionally survives process restarts.  It can expire
             # during downtime, but that is not a "recovered as paused" state.
             break_completed = self._sync_break_to_wall(now_wall_ms)
-            if needs_runtime_migration or break_completed:
+            if needs_runtime_migration or needs_cycle_migration or break_completed:
                 self._commit()
             if break_completed:
                 self.startup_events.append(TimerEvent.BREAK_COMPLETED)
+        elif needs_runtime_migration or needs_cycle_migration:
+            self._commit()
 
         if (
             self._snapshot.status is TimerStatus.IDLE
@@ -75,6 +91,28 @@ class TimerEngine:
 
     def set_config(self, config: TimerConfig) -> None:
         self.config = config
+
+    def _cycle_history_limit(self) -> int:
+        return max(0, self.config.sessions_before_long_break - 1)
+
+    def _trim_cycle_focus_history(self) -> None:
+        """Keep exactly the starts that can still precede the next focus."""
+        limit = self._cycle_history_limit()
+        if limit == 0:
+            self._recent_cycle_focus_starts.clear()
+        else:
+            self._recent_cycle_focus_starts = self._recent_cycle_focus_starts[-limit:]
+
+    def _set_idle(self) -> None:
+        self._snapshot = RuntimeSnapshot(
+            status=TimerStatus.IDLE,
+            remaining_ms=0,
+            completed_in_cycle=len(self._recent_cycle_focus_starts),
+            break_kind=None,
+            phase_total_ms=0,
+            break_deadline_wall_ms=None,
+            focus_started_at_wall_ms=None,
+        )
 
     def _reset_anchors(self) -> None:
         self._anchor_monotonic_ms = self.clock.monotonic_ms()
@@ -108,28 +146,75 @@ class TimerEngine:
             completion_days or (),
             updated_at_wall_ms=self.clock.wall_epoch_ms(),
             current_focus_pending=persisted_pending,
+            recent_cycle_focus_starts=self._recent_cycle_focus_starts,
         )
         if finalize_current_focus or discard_current_focus:
             self._pending_focus.clear()
 
-    def _complete_focus(self, completion_wall_ms: int) -> tuple[TimerEvent, str]:
+    def _break_kind_after_qualified_focus(
+        self,
+        completion_wall_ms: int,
+    ) -> BreakKind:
+        """Update the rolling qualified-focus history and select its break.
+
+        The stored timestamps are focus *starts*.  Four starts plus the fourth
+        completion must fit in three hours to form one continuous work block.
+        A legacy active focus has no reliable start timestamp, so it safely
+        breaks (rather than guesses at) an existing streak.
+        """
+        focus_started_at_wall_ms = self._snapshot.focus_started_at_wall_ms
+        if focus_started_at_wall_ms is None:
+            self._recent_cycle_focus_starts.clear()
+            return BreakKind.SHORT
+
+        # Wall-clock corrections must not make a future timestamp appear
+        # continuous.  Old starts beyond the window cannot help a later focus.
+        recent_starts = [
+            start_ms
+            for start_ms in self._recent_cycle_focus_starts
+            if 0 <= completion_wall_ms - start_ms <= CONTINUOUS_FOCUS_WINDOW_MS
+        ]
+        if focus_started_at_wall_ms > completion_wall_ms:
+            # Keep a clock correction from manufacturing a negative span.
+            focus_started_at_wall_ms = completion_wall_ms
+        candidates = [*recent_starts, focus_started_at_wall_ms]
+        required_sessions = self.config.sessions_before_long_break
+        if len(candidates) >= required_sessions:
+            earliest_start_ms = candidates[-required_sessions]
+            span_ms = completion_wall_ms - earliest_start_ms
+            if 0 <= span_ms <= CONTINUOUS_FOCUS_WINDOW_MS:
+                self._recent_cycle_focus_starts.clear()
+                return BreakKind.LONG
+
+        limit = self._cycle_history_limit()
+        self._recent_cycle_focus_starts = (
+            candidates[-limit:] if limit else []
+        )
+        return BreakKind.SHORT
+
+    def _complete_focus(
+        self,
+        completion_wall_ms: int,
+    ) -> tuple[TimerEvent | None, str | None]:
+        if self._focus_elapsed_ms() < MINIMUM_RECORDED_FOCUS_MS:
+            self._set_idle()
+            return None, None
+
         completion_day = local_day(completion_wall_ms)
-        next_cycle_count = self._snapshot.completed_in_cycle + 1
-        if next_cycle_count >= self.config.sessions_before_long_break:
-            kind = BreakKind.LONG
-            next_cycle_count = 0
+        kind = self._break_kind_after_qualified_focus(completion_wall_ms)
+        if kind is BreakKind.LONG:
             break_seconds = self.config.long_break_seconds
         else:
-            kind = BreakKind.SHORT
             break_seconds = self.config.short_break_seconds
 
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.BREAK_RUNNING,
             remaining_ms=break_seconds * 1000,
-            completed_in_cycle=next_cycle_count,
+            completed_in_cycle=len(self._recent_cycle_focus_starts),
             break_kind=kind,
             phase_total_ms=break_seconds * 1000,
             break_deadline_wall_ms=completion_wall_ms + break_seconds * 1000,
+            focus_started_at_wall_ms=None,
         )
         return TimerEvent.FOCUS_COMPLETED, completion_day
 
@@ -145,21 +230,15 @@ class TimerEngine:
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.BREAK_RUNNING,
             remaining_ms=break_ms,
-            completed_in_cycle=self._snapshot.completed_in_cycle,
+            completed_in_cycle=len(self._recent_cycle_focus_starts),
             break_kind=BreakKind.SHORT,
             phase_total_ms=break_ms,
             break_deadline_wall_ms=start_wall_ms + break_ms,
+            focus_started_at_wall_ms=None,
         )
 
     def _complete_break(self) -> TimerEvent:
-        self._snapshot = RuntimeSnapshot(
-            status=TimerStatus.IDLE,
-            remaining_ms=0,
-            completed_in_cycle=self._snapshot.completed_in_cycle,
-            break_kind=None,
-            phase_total_ms=0,
-            break_deadline_wall_ms=None,
-        )
+        self._set_idle()
         return TimerEvent.BREAK_COMPLETED
 
     def _sync_break_to_wall(self, now_wall_ms: int) -> bool:
@@ -185,6 +264,8 @@ class TimerEngine:
         now_wall_ms = self.clock.wall_epoch_ms()
         events: list[TimerEvent] = []
         completion_days: list[str] = []
+        finalize_current_focus = False
+        discard_current_focus = False
 
         if self._snapshot.status is TimerStatus.FOCUS_RUNNING:
             elapsed_ms = max(0, now_monotonic_ms - self._anchor_monotonic_ms)
@@ -197,8 +278,13 @@ class TimerEngine:
 
                 if self._snapshot.remaining_ms <= 0:
                     event, completion_day = self._complete_focus(cursor_wall_ms)
-                    events.append(event)
-                    completion_days.append(completion_day)
+                    if event is None:
+                        discard_current_focus = True
+                    else:
+                        assert completion_day is not None
+                        events.append(event)
+                        completion_days.append(completion_day)
+                        finalize_current_focus = True
 
         if self._snapshot.status is TimerStatus.BREAK_RUNNING:
             if self._sync_break_to_wall(now_wall_ms):
@@ -207,10 +293,11 @@ class TimerEngine:
         self._anchor_monotonic_ms = now_monotonic_ms
         self._anchor_wall_ms = now_wall_ms
 
-        if events:
+        if events or finalize_current_focus or discard_current_focus:
             self._commit(
                 completion_days,
-                finalize_current_focus=TimerEvent.FOCUS_COMPLETED in events,
+                finalize_current_focus=finalize_current_focus,
+                discard_current_focus=discard_current_focus,
             )
         return events
 
@@ -236,13 +323,15 @@ class TimerEngine:
         )
         if focus_seconds <= 0:
             raise ValueError("focus duration must be positive")
+        focus_started_at_wall_ms = self.clock.wall_epoch_ms()
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.FOCUS_RUNNING,
             remaining_ms=focus_seconds * 1000,
-            completed_in_cycle=self._snapshot.completed_in_cycle,
+            completed_in_cycle=len(self._recent_cycle_focus_starts),
             break_kind=None,
             phase_total_ms=focus_seconds * 1000,
             break_deadline_wall_ms=None,
+            focus_started_at_wall_ms=focus_started_at_wall_ms,
         )
         self._pending_focus.clear()
         self._reset_anchors()
@@ -267,15 +356,8 @@ class TimerEngine:
         events = self._advance()
         if self._snapshot.status.is_focus:
             actual_focus_ms = self._focus_elapsed_ms()
-            if actual_focus_ms < EARLY_END_MINIMUM_FOCUS_MS:
-                self._snapshot = RuntimeSnapshot(
-                    status=TimerStatus.IDLE,
-                    remaining_ms=0,
-                    completed_in_cycle=self._snapshot.completed_in_cycle,
-                    break_kind=None,
-                    phase_total_ms=0,
-                    break_deadline_wall_ms=None,
-                )
+            if actual_focus_ms < MINIMUM_RECORDED_FOCUS_MS:
+                self._set_idle()
                 self._commit(discard_current_focus=True)
             else:
                 self._start_break_for_early_focus_end(
@@ -289,14 +371,7 @@ class TimerEngine:
     def end_break(self) -> list[TimerEvent]:
         events = self._advance()
         if self._snapshot.status.is_break:
-            self._snapshot = RuntimeSnapshot(
-                status=TimerStatus.IDLE,
-                remaining_ms=0,
-                completed_in_cycle=self._snapshot.completed_in_cycle,
-                break_kind=None,
-                phase_total_ms=0,
-                break_deadline_wall_ms=None,
-            )
+            self._set_idle()
             self._commit()
         return events
 
@@ -320,7 +395,7 @@ class TimerEngine:
         persisted = self.store.stats_for_day(day)
         provisional_focus_ms = (
             self._pending_focus.get(day, 0)
-            if self._focus_elapsed_ms() >= EARLY_END_MINIMUM_FOCUS_MS
+            if self._focus_elapsed_ms() >= MINIMUM_RECORDED_FOCUS_MS
             else 0
         )
         return DailyStats(

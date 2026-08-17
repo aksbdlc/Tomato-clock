@@ -23,9 +23,15 @@ class SQLiteStoreTest(unittest.TestCase):
                     break_kind=BreakKind.LONG,
                     phase_total_ms=30_000,
                     break_deadline_wall_ms=1_800_000_000_000,
+                    focus_started_at_wall_ms=None,
                 ),
                 {"2026-05-01": 61_000, "2026-05-02": 2_000},
                 ("2026-05-01", "2026-05-01"),
+                recent_cycle_focus_starts=(
+                    1_799_999_000_000,
+                    1_799_999_500_000,
+                    1_799_999_750_000,
+                ),
             )
             first.close()
 
@@ -40,7 +46,12 @@ class SQLiteStoreTest(unittest.TestCase):
                     break_kind=BreakKind.LONG,
                     phase_total_ms=30_000,
                     break_deadline_wall_ms=1_800_000_000_000,
+                    focus_started_at_wall_ms=None,
                 ),
+            )
+            self.assertEqual(
+                second.load_cycle_focus_starts(),
+                (1_799_999_000_000, 1_799_999_500_000, 1_799_999_750_000),
             )
             self.assertEqual(second.stats_for_day("2026-05-01").focus_ms, 61_000)
             self.assertEqual(
@@ -180,6 +191,7 @@ class SQLiteStoreTest(unittest.TestCase):
                     focus_ms INTEGER NOT NULL DEFAULT 0,
                     completed_sessions INTEGER NOT NULL DEFAULT 0
                 );
+                INSERT INTO daily_stats VALUES ('2026-06-01', 120000, 2);
                 """
             )
             connection.close()
@@ -189,6 +201,84 @@ class SQLiteStoreTest(unittest.TestCase):
             snapshot = store.load_runtime()
             self.assertEqual(snapshot.remaining_ms, 42_000)
             self.assertEqual(snapshot.phase_total_ms, 42_000)
+            self.assertIsNone(snapshot.focus_started_at_wall_ms)
+            self.assertEqual(store.load_cycle_focus_starts(), ())
+            self.assertEqual(
+                store.stats_for_day("2026-06-01").focus_ms,
+                120_000,
+            )
+            self.assertEqual(
+                store.stats_for_day("2026-06-01").completed_sessions,
+                2,
+            )
+
+    def test_runtime_persists_active_focus_start_timestamp(self) -> None:
+        store = SQLiteStore(":memory:")
+        self.addCleanup(store.close)
+        snapshot = RuntimeSnapshot(
+            status=TimerStatus.FOCUS_RUNNING,
+            remaining_ms=1_400_000,
+            phase_total_ms=1_500_000,
+            focus_started_at_wall_ms=1_800_000_000_000,
+        )
+
+        store.commit(snapshot)
+
+        self.assertEqual(store.load_runtime(), snapshot)
+
+    def test_cycle_focus_starts_are_ordered_and_bounded_to_ninety_nine(self) -> None:
+        store = SQLiteStore(":memory:")
+        self.addCleanup(store.close)
+
+        store.commit(
+            RuntimeSnapshot(),
+            recent_cycle_focus_starts=tuple(range(100)),
+        )
+
+        self.assertEqual(store.load_cycle_focus_starts(), tuple(range(1, 100)))
+
+    def test_cycle_focus_history_replacement_is_atomic_with_stats_and_runtime(self) -> None:
+        store = SQLiteStore(":memory:")
+        self.addCleanup(store.close)
+        original = RuntimeSnapshot(
+            status=TimerStatus.FOCUS_PAUSED,
+            remaining_ms=20_000,
+            phase_total_ms=60_000,
+            focus_started_at_wall_ms=100,
+        )
+        store.commit(
+            original,
+            {"2026-06-01": 1_000},
+            recent_cycle_focus_starts=(100,),
+        )
+        store.connection.execute(
+            """
+            CREATE TRIGGER reject_cycle_start
+            BEFORE INSERT ON recent_cycle_focus_starts
+            WHEN NEW.started_at_wall_ms = 400
+            BEGIN
+                SELECT RAISE(ABORT, 'test rollback');
+            END
+            """
+        )
+        store.connection.commit()
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "test rollback"):
+            store.commit(
+                RuntimeSnapshot(
+                    status=TimerStatus.BREAK_RUNNING,
+                    remaining_ms=10_000,
+                    break_kind=BreakKind.SHORT,
+                    phase_total_ms=10_000,
+                    break_deadline_wall_ms=900,
+                ),
+                {"2026-06-01": 2_000},
+                recent_cycle_focus_starts=(400,),
+            )
+
+        self.assertEqual(store.load_runtime(), original)
+        self.assertEqual(store.stats_for_day("2026-06-01").focus_ms, 1_000)
+        self.assertEqual(store.load_cycle_focus_starts(), (100,))
 
 
 if __name__ == "__main__":

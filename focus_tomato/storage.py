@@ -40,6 +40,11 @@ class SQLiteStore:
                 phase_total_ms INTEGER NOT NULL DEFAULT 0
                     CHECK (phase_total_ms >= 0),
                 break_deadline_wall_ms INTEGER,
+                focus_started_at_wall_ms INTEGER
+                    CHECK (
+                        focus_started_at_wall_ms IS NULL
+                        OR focus_started_at_wall_ms >= 0
+                    ),
                 updated_at TEXT NOT NULL
             );
 
@@ -57,6 +62,15 @@ class SQLiteStore:
                 focus_ms INTEGER NOT NULL CHECK (focus_ms >= 0),
                 PRIMARY KEY (singleton_id, day)
             );
+
+            CREATE TABLE IF NOT EXISTS recent_cycle_focus_starts (
+                singleton_id INTEGER NOT NULL DEFAULT 1
+                    CHECK (singleton_id = 1),
+                ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 98),
+                started_at_wall_ms INTEGER NOT NULL
+                    CHECK (started_at_wall_ms >= 0),
+                PRIMARY KEY (singleton_id, ordinal)
+            );
             """
         )
         runtime_columns = {
@@ -72,12 +86,18 @@ class SQLiteStore:
                 "ALTER TABLE runtime_state "
                 "ADD COLUMN break_deadline_wall_ms INTEGER"
             )
+        if "focus_started_at_wall_ms" not in runtime_columns:
+            self.connection.execute(
+                "ALTER TABLE runtime_state "
+                "ADD COLUMN focus_started_at_wall_ms INTEGER"
+            )
         self.connection.execute(
             """
             INSERT OR IGNORE INTO runtime_state (
                 singleton_id, status, remaining_ms, completed_in_cycle,
-                break_kind, phase_total_ms, break_deadline_wall_ms, updated_at
-            ) VALUES (1, ?, 0, 0, NULL, 0, NULL, ?)
+                break_kind, phase_total_ms, break_deadline_wall_ms,
+                focus_started_at_wall_ms, updated_at
+            ) VALUES (1, ?, 0, 0, NULL, 0, NULL, NULL, ?)
             """,
             (TimerStatus.IDLE.value, datetime.now().astimezone().isoformat()),
         )
@@ -108,7 +128,8 @@ class SQLiteStore:
         row = self.connection.execute(
             """
             SELECT status, remaining_ms, completed_in_cycle, break_kind,
-                   phase_total_ms, break_deadline_wall_ms, updated_at
+                   phase_total_ms, break_deadline_wall_ms,
+                   focus_started_at_wall_ms, updated_at
             FROM runtime_state WHERE singleton_id = 1
             """
         ).fetchone()
@@ -135,14 +156,26 @@ class SQLiteStore:
             )
         except (TypeError, ValueError):
             break_deadline_wall_ms = None
+        try:
+            focus_started_value = row[6]
+            focus_started_at_wall_ms = (
+                max(0, int(focus_started_value))
+                if focus_started_value is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            focus_started_at_wall_ms = None
 
         if status is TimerStatus.IDLE:
             remaining_ms = 0
             break_kind = None
             phase_total_ms = 0
             break_deadline_wall_ms = None
+            focus_started_at_wall_ms = None
         elif status.is_break and break_kind is None:
             break_kind = BreakKind.SHORT
+        if not status.is_focus:
+            focus_started_at_wall_ms = None
         if status is not TimerStatus.IDLE and phase_total_ms < remaining_ms:
             # Existing databases did not store the original phase duration.
             phase_total_ms = remaining_ms
@@ -160,7 +193,7 @@ class SQLiteStore:
                 break_deadline_wall_ms = now_ms + remaining_ms
                 needs_runtime_migration = True
             elif break_deadline_wall_ms is None:
-                saved_at_ms = self._parse_updated_at_ms(row[6])
+                saved_at_ms = self._parse_updated_at_ms(row[7])
                 break_deadline_wall_ms = (saved_at_ms or now_ms) + remaining_ms
                 needs_runtime_migration = True
 
@@ -172,6 +205,7 @@ class SQLiteStore:
                 break_kind,
                 phase_total_ms,
                 break_deadline_wall_ms,
+                focus_started_at_wall_ms,
             ),
             needs_runtime_migration,
         )
@@ -203,6 +237,31 @@ class SQLiteStore:
             if int(focus_ms) > 0
         }
 
+    def load_cycle_focus_starts(self) -> tuple[int, ...]:
+        """Return the ordered starts of the most recent qualified focuses.
+
+        The table is intentionally bounded to 99 rows, which supports the
+        largest configurable long-break cycle (100 focuses) without retaining
+        an unbounded event log.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT started_at_wall_ms
+            FROM recent_cycle_focus_starts
+            WHERE singleton_id = 1
+            ORDER BY ordinal ASC
+            """
+        ).fetchall()
+        starts: list[int] = []
+        for (value,) in rows:
+            try:
+                start_ms = int(value)
+            except (TypeError, ValueError):
+                continue
+            if start_ms >= 0:
+                starts.append(start_ms)
+        return tuple(starts[-99:])
+
     def commit(
         self,
         snapshot: RuntimeSnapshot,
@@ -211,8 +270,19 @@ class SQLiteStore:
         *,
         updated_at_wall_ms: int | None = None,
         current_focus_pending: Mapping[str, int] | None = None,
+        recent_cycle_focus_starts: Sequence[int] | None = None,
     ) -> None:
         allocations = focus_allocations or {}
+        normalized_cycle_starts: tuple[int, ...] | None = None
+        if recent_cycle_focus_starts is not None:
+            try:
+                normalized_cycle_starts = tuple(
+                    int(start_ms) for start_ms in recent_cycle_focus_starts
+                )[-99:]
+            except (TypeError, ValueError) as error:
+                raise ValueError("cycle focus starts must be integer timestamps") from error
+            if any(start_ms < 0 for start_ms in normalized_cycle_starts):
+                raise ValueError("cycle focus starts must be nonnegative")
         cursor = self.connection.cursor()
         try:
             cursor.execute("BEGIN IMMEDIATE")
@@ -253,12 +323,25 @@ class SQLiteStore:
                         """,
                         (day, int(duration_ms)),
                     )
+            if normalized_cycle_starts is not None:
+                cursor.execute(
+                    "DELETE FROM recent_cycle_focus_starts WHERE singleton_id = 1"
+                )
+                cursor.executemany(
+                    """
+                    INSERT INTO recent_cycle_focus_starts (
+                        singleton_id, ordinal, started_at_wall_ms
+                    ) VALUES (1, ?, ?)
+                    """,
+                    enumerate(normalized_cycle_starts),
+                )
             cursor.execute(
                 """
                 UPDATE runtime_state SET
                     status = ?, remaining_ms = ?, completed_in_cycle = ?,
                     break_kind = ?, phase_total_ms = ?,
-                    break_deadline_wall_ms = ?, updated_at = ?
+                    break_deadline_wall_ms = ?, focus_started_at_wall_ms = ?,
+                    updated_at = ?
                 WHERE singleton_id = 1
                 """,
                 (
@@ -270,6 +353,11 @@ class SQLiteStore:
                     (
                         int(snapshot.break_deadline_wall_ms)
                         if snapshot.break_deadline_wall_ms is not None
+                        else None
+                    ),
+                    (
+                        int(snapshot.focus_started_at_wall_ms)
+                        if snapshot.focus_started_at_wall_ms is not None
                         else None
                     ),
                     self._updated_at_value(updated_at_wall_ms),

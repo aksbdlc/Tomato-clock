@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import replace
+from uuid import uuid4
 
 from .clock import Clock, SystemClock
 from .config import TimerConfig
@@ -9,6 +10,7 @@ from .models import (
     BreakKind,
     DailyStats,
     RuntimeSnapshot,
+    TaskOutcome,
     TimerEvent,
     TimerStatus,
 )
@@ -115,6 +117,7 @@ class TimerEngine:
             )
 
     def _set_idle(self) -> None:
+        next_goal = self._snapshot.next_goal
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.IDLE,
             remaining_ms=0,
@@ -124,6 +127,7 @@ class TimerEngine:
             break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
             long_break_recommended=False,
+            next_goal=next_goal,
         )
 
     def _reset_anchors(self) -> None:
@@ -213,8 +217,13 @@ class TimerEngine:
         self,
         completion_wall_ms: int,
     ) -> tuple[TimerEvent | None, str | None]:
-        if self._focus_elapsed_ms() < MINIMUM_RECORDED_FOCUS_MS:
+        started_at_wall_ms = self._snapshot.focus_started_at_wall_ms
+        session_id = self._snapshot.task_session_id
+        focus_goal = self._snapshot.focus_goal
+        focus_ms = self._focus_elapsed_ms()
+        if focus_ms < MINIMUM_RECORDED_FOCUS_MS:
             self._recent_cycle_focus_intervals.clear()
+            self._snapshot.next_goal = self._snapshot.focus_goal
             self._set_idle()
             return None, None
 
@@ -233,7 +242,16 @@ class TimerEngine:
             break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
             long_break_recommended=recommendation,
+            focus_goal=focus_goal,
+            task_session_id=session_id,
+            break_task=None,
+            break_task_outcome=TaskOutcome.UNRECORDED,
+            break_task_confirmed=False,
         )
+        if session_id:
+            self.store.create_task_record(
+                session_id, focus_goal, started_at_wall_ms, focus_ms
+            )
         return TimerEvent.FOCUS_COMPLETED, completion_day
 
     def _focus_elapsed_ms(self) -> int:
@@ -243,6 +261,9 @@ class TimerEngine:
         self,
         actual_focus_ms: int,
     ) -> None:
+        started_at_wall_ms = self._snapshot.focus_started_at_wall_ms
+        session_id = self._snapshot.task_session_id
+        focus_goal = self._snapshot.focus_goal
         break_ms = actual_focus_ms // 5
         self._recent_cycle_focus_intervals.clear()
         self._snapshot = RuntimeSnapshot(
@@ -254,9 +275,27 @@ class TimerEngine:
             break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
             long_break_recommended=False,
+            focus_goal=focus_goal,
+            task_session_id=session_id,
         )
+        if session_id:
+            self.store.create_task_record(
+                session_id, focus_goal, started_at_wall_ms, actual_focus_ms
+            )
 
     def _complete_break(self) -> TimerEvent:
+        if (
+            self._snapshot.break_task
+            and self._snapshot.task_session_id
+            and self._snapshot.break_task_outcome is TaskOutcome.UNRECORDED
+        ):
+            self._snapshot.break_task_outcome = TaskOutcome.COMPLETED
+            self.store.update_task_record(
+                self._snapshot.task_session_id,
+                task_text=self._snapshot.break_task,
+                outcome=TaskOutcome.COMPLETED,
+                completed_at_wall_ms=self.clock.wall_epoch_ms(),
+            )
         self._set_idle()
         return TimerEvent.BREAK_COMPLETED
 
@@ -332,7 +371,9 @@ class TimerEngine:
             self._commit()
         return events
 
-    def start_focus(self, duration_seconds: int | None = None) -> None:
+    def start_focus(
+        self, duration_seconds: int | None = None, goal: str | None = None
+    ) -> None:
         if self._snapshot.status is not TimerStatus.IDLE:
             return
         focus_seconds = (
@@ -343,6 +384,9 @@ class TimerEngine:
         if focus_seconds <= 0:
             raise ValueError("focus duration must be positive")
         focus_started_at_wall_ms = self.clock.wall_epoch_ms()
+        normalized_goal = (goal if goal is not None else self._snapshot.next_goal) or None
+        if normalized_goal is not None:
+            normalized_goal = normalized_goal[:20]
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.FOCUS_RUNNING,
             remaining_ms=focus_seconds * 1000,
@@ -351,6 +395,8 @@ class TimerEngine:
             phase_total_ms=focus_seconds * 1000,
             break_deadline_wall_ms=None,
             focus_started_at_wall_ms=focus_started_at_wall_ms,
+            focus_goal=normalized_goal,
+            task_session_id=str(uuid4()),
         )
         self._pending_focus.clear()
         self._reset_anchors()
@@ -394,6 +440,64 @@ class TimerEngine:
         self._snapshot.break_deadline_wall_ms = (
             now_wall_ms + self._snapshot.remaining_ms
         )
+        self._commit()
+        return True
+
+    @property
+    def task_goal(self) -> str | None:
+        return self._snapshot.focus_goal
+
+    @property
+    def next_goal(self) -> str | None:
+        return self._snapshot.next_goal
+
+    def set_next_goal(self, goal: str | None) -> None:
+        self._snapshot.next_goal = (goal or None)
+        self._commit()
+
+    def confirm_break_task(
+        self,
+        task_text: str | None,
+        outcome: TaskOutcome = TaskOutcome.COMPLETED,
+    ) -> bool:
+        if not self._snapshot.status.is_break or not self._snapshot.task_session_id:
+            return False
+        text = (task_text or "").strip()[:20] or None
+        self._snapshot.break_task = text
+        has_goal = bool(self._snapshot.focus_goal)
+        self._snapshot.break_task_outcome = (
+            outcome if (text or has_goal) else TaskOutcome.UNRECORDED
+        )
+        self._snapshot.break_task_confirmed = bool(text or has_goal)
+        if text or has_goal:
+            if outcome is TaskOutcome.INCOMPLETE and self._snapshot.focus_goal:
+                self._snapshot.next_goal = self._snapshot.focus_goal
+            elif outcome is TaskOutcome.COMPLETED:
+                self._snapshot.next_goal = None
+            self.store.update_task_record(
+                self._snapshot.task_session_id,
+                task_text=text,
+                outcome=self._snapshot.break_task_outcome,
+                completed_at_wall_ms=self.clock.wall_epoch_ms(),
+            )
+        self._commit()
+        return True
+
+    def set_break_task_draft(self, task_text: str | None) -> bool:
+        if not self._snapshot.status.is_break:
+            return False
+        self._snapshot.break_task = (task_text or "")[:20] or None
+        self._snapshot.break_task_outcome = TaskOutcome.UNRECORDED
+        self._snapshot.break_task_confirmed = False
+        self._commit()
+        return True
+
+    def clear_break_task(self) -> bool:
+        if not self._snapshot.status.is_break:
+            return False
+        self._snapshot.break_task = None
+        self._snapshot.break_task_outcome = TaskOutcome.UNRECORDED
+        self._snapshot.break_task_confirmed = False
         self._commit()
         return True
 

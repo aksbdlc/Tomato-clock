@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import BreakKind, DailyStats, RuntimeSnapshot, TimerStatus
+from .models import BreakKind, DailyStats, RuntimeSnapshot, TaskOutcome, TimerStatus
 
 
 APP_DIR_NAME = "focus-tomato"
@@ -78,6 +78,16 @@ class SQLiteStore:
                     ),
                 PRIMARY KEY (singleton_id, ordinal)
             );
+
+            CREATE TABLE IF NOT EXISTS task_records (
+                session_id TEXT PRIMARY KEY,
+                goal TEXT,
+                task_text TEXT,
+                outcome TEXT NOT NULL DEFAULT 'unrecorded',
+                started_at_wall_ms INTEGER,
+                completed_at_wall_ms INTEGER,
+                focus_ms INTEGER NOT NULL DEFAULT 0 CHECK (focus_ms >= 0)
+            );
             """
         )
         runtime_columns = {
@@ -103,6 +113,21 @@ class SQLiteStore:
                 "ALTER TABLE runtime_state "
                 "ADD COLUMN long_break_recommended INTEGER NOT NULL DEFAULT 0"
             )
+        runtime_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(runtime_state)")
+        }
+        for name, definition in {
+            "focus_goal": "TEXT",
+            "next_goal": "TEXT",
+            "task_session_id": "TEXT",
+            "break_task": "TEXT",
+            "break_task_outcome": "TEXT NOT NULL DEFAULT 'unrecorded'",
+            "break_task_confirmed": "INTEGER NOT NULL DEFAULT 0",
+        }.items():
+            if name not in runtime_columns:
+                self.connection.execute(
+                    f"ALTER TABLE runtime_state ADD COLUMN {name} {definition}"
+                )
         cycle_columns = {
             row[1]
             for row in self.connection.execute(
@@ -152,7 +177,9 @@ class SQLiteStore:
             """
             SELECT status, remaining_ms, completed_in_cycle, break_kind,
                    phase_total_ms, break_deadline_wall_ms,
-                   focus_started_at_wall_ms, long_break_recommended, updated_at
+                   focus_started_at_wall_ms, long_break_recommended, updated_at,
+                   focus_goal, next_goal, task_session_id, break_task,
+                   break_task_outcome, break_task_confirmed
             FROM runtime_state WHERE singleton_id = 1
             """
         ).fetchone()
@@ -189,6 +216,15 @@ class SQLiteStore:
         except (TypeError, ValueError):
             focus_started_at_wall_ms = None
         long_break_recommended = bool(row[7])
+        focus_goal = row[9] or None
+        next_goal = row[10] or None
+        task_session_id = row[11] or None
+        break_task = row[12] or None
+        try:
+            break_task_outcome = TaskOutcome(row[13])
+        except (TypeError, ValueError):
+            break_task_outcome = TaskOutcome.UNRECORDED
+        break_task_confirmed = bool(row[14])
 
         if status is TimerStatus.IDLE:
             remaining_ms = 0
@@ -197,6 +233,11 @@ class SQLiteStore:
             break_deadline_wall_ms = None
             focus_started_at_wall_ms = None
             long_break_recommended = False
+            focus_goal = None
+            task_session_id = None
+            break_task = None
+            break_task_outcome = TaskOutcome.UNRECORDED
+            break_task_confirmed = False
         elif status is TimerStatus.BREAK_READY:
             break_kind = None
             break_deadline_wall_ms = None
@@ -230,14 +271,16 @@ class SQLiteStore:
 
         return (
             RuntimeSnapshot(
-                status,
-                remaining_ms,
-                completed_in_cycle,
-                break_kind,
-                phase_total_ms,
-                break_deadline_wall_ms,
-                focus_started_at_wall_ms,
-                long_break_recommended,
+                status=status, remaining_ms=remaining_ms,
+                completed_in_cycle=completed_in_cycle, break_kind=break_kind,
+                phase_total_ms=phase_total_ms,
+                break_deadline_wall_ms=break_deadline_wall_ms,
+                focus_started_at_wall_ms=focus_started_at_wall_ms,
+                long_break_recommended=long_break_recommended,
+                focus_goal=focus_goal, next_goal=next_goal,
+                task_session_id=task_session_id, break_task=break_task,
+                break_task_outcome=break_task_outcome,
+                break_task_confirmed=break_task_confirmed,
             ),
             needs_runtime_migration,
         )
@@ -435,6 +478,8 @@ class SQLiteStore:
                     break_kind = ?, phase_total_ms = ?,
                     break_deadline_wall_ms = ?, focus_started_at_wall_ms = ?,
                     long_break_recommended = ?,
+                    focus_goal = ?, next_goal = ?, task_session_id = ?,
+                    break_task = ?, break_task_outcome = ?, break_task_confirmed = ?,
                     updated_at = ?
                 WHERE singleton_id = 1
                 """,
@@ -455,6 +500,12 @@ class SQLiteStore:
                         else None
                     ),
                     int(snapshot.long_break_recommended),
+                    snapshot.focus_goal,
+                    snapshot.next_goal,
+                    snapshot.task_session_id,
+                    snapshot.break_task,
+                    snapshot.break_task_outcome.value,
+                    int(snapshot.break_task_confirmed),
                     self._updated_at_value(updated_at_wall_ms),
                 ),
             )
@@ -463,6 +514,36 @@ class SQLiteStore:
             raise
         else:
             self.connection.commit()
+
+    def create_task_record(
+        self,
+        session_id: str,
+        goal: str | None,
+        started_at_wall_ms: int | None,
+        focus_ms: int = 0,
+    ) -> None:
+        self.connection.execute(
+            """INSERT OR IGNORE INTO task_records
+               (session_id, goal, started_at_wall_ms, focus_ms)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, goal, started_at_wall_ms, int(focus_ms)),
+        )
+        self.connection.commit()
+
+    def update_task_record(
+        self,
+        session_id: str,
+        *,
+        task_text: str | None,
+        outcome: TaskOutcome,
+        completed_at_wall_ms: int | None,
+    ) -> None:
+        self.connection.execute(
+            """UPDATE task_records SET task_text = ?, outcome = ?,
+               completed_at_wall_ms = ? WHERE session_id = ?""",
+            (task_text, outcome.value, completed_at_wall_ms, session_id),
+        )
+        self.connection.commit()
 
     def stats_for_day(self, day: str) -> DailyStats:
         row = self.connection.execute(

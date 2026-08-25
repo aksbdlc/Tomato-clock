@@ -19,7 +19,7 @@ from gi.repository import AyatanaAppIndicator3, Gdk, Gio, GLib, Gtk, Notify
 from .autostart import sync_autostart
 from .config import ConfigError, config_path, load_config
 from .engine import TimerEngine
-from .models import BreakKind, RuntimeSnapshot, TimerEvent, TimerStatus
+from .models import BreakKind, RuntimeSnapshot, TaskOutcome, TimerEvent, TimerStatus
 from .storage import SQLiteStore
 
 
@@ -120,6 +120,33 @@ _REST_SCREEN_CSS = b"""
     color: rgba(255, 255, 255, 0.72);
     font-size: 14px;
 }
+
+.focus-tomato-task-row {
+    margin-top: 4px;
+}
+.focus-tomato-task-entry {
+    background-color: rgba(255,255,255,0.95);
+    color: #222222;
+    border-radius: 18px;
+    padding: 7px 10px;
+    min-width: 260px;
+}
+.focus-tomato-task-icon {
+    background-image: none;
+    background-color: rgba(0,0,0,0.18);
+    color: #ffffff;
+    border-radius: 18px;
+    min-width: 36px;
+    min-height: 36px;
+    padding: 0;
+}
+.focus-tomato-task-choice {
+    background-image: none;
+    background-color: rgba(0,0,0,0.18);
+    color: #ffffff;
+    border-radius: 5px;
+    padding: 5px 10px;
+}
 """
 
 
@@ -171,6 +198,20 @@ class FocusTomatoApplication(Gtk.Application):
         self._rest_screen_focus_countdown: Gtk.Label | None = None
         self._rest_screen_focus_hint: Gtk.Label | None = None
         self._rest_screen_focus_button: Gtk.Button | None = None
+        self._focus_goal_plus: Gtk.Button | None = None
+        self._focus_goal_entry: Gtk.Entry | None = None
+        self._focus_goal_confirm: Gtk.Button | None = None
+        self._focus_goal_clear: Gtk.Button | None = None
+        self._break_task_label: Gtk.Label | None = None
+        self._break_task_plus: Gtk.Button | None = None
+        self._break_task_entry: Gtk.Entry | None = None
+        self._break_task_confirm: Gtk.Button | None = None
+        self._break_task_clear: Gtk.Button | None = None
+        self._break_task_entry_row: Gtk.Box | None = None
+        self._break_task_completed: Gtk.Button | None = None
+        self._break_task_incomplete: Gtk.Button | None = None
+        self._focus_goal_expanded = False
+        self._break_task_expanded = False
         self._rest_screen_lower_slot_size_group: Gtk.SizeGroup | None = None
         self._rest_screen_focus_duration_text = ""
         self._rest_screen_focus_replace_on_input = False
@@ -344,6 +385,43 @@ class FocusTomatoApplication(Gtk.Application):
         break_content.pack_start(countdown, False, False, 0)
         break_content.pack_start(stats, False, False, 0)
         break_content.pack_start(long_break_hint, False, False, 0)
+        break_task_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        break_task_box.set_halign(Gtk.Align.CENTER)
+        break_task_label = Gtk.Label()
+        break_task_label.set_xalign(0.5)
+        break_task_box.pack_start(break_task_label, False, False, 0)
+        break_task_controls = Gtk.Box(spacing=8)
+        break_task_plus = Gtk.Button(label="＋")
+        break_task_plus.get_style_context().add_class("focus-tomato-task-icon")
+        break_task_plus.connect("clicked", lambda _b: self._toggle_break_task_editor(True))
+        break_task_controls.pack_start(break_task_plus, False, False, 0)
+        break_task_completed = Gtk.Button(label="✓ 已完成")
+        break_task_completed.get_style_context().add_class("focus-tomato-task-choice")
+        break_task_completed.connect("clicked", lambda _b: self._confirm_break_task(TaskOutcome.COMPLETED))
+        break_task_incomplete = Gtk.Button(label="未完成")
+        break_task_incomplete.get_style_context().add_class("focus-tomato-task-choice")
+        break_task_incomplete.connect("clicked", lambda _b: self._confirm_break_task(TaskOutcome.INCOMPLETE))
+        break_task_controls.pack_start(break_task_completed, False, False, 0)
+        break_task_controls.pack_start(break_task_incomplete, False, False, 0)
+        break_task_box.pack_start(break_task_controls, False, False, 0)
+        break_task_entry_row = Gtk.Box(spacing=5)
+        break_task_entry = Gtk.Entry()
+        break_task_entry.set_max_length(20)
+        break_task_entry.set_placeholder_text("记录完成的任务")
+        break_task_entry.get_style_context().add_class("focus-tomato-task-entry")
+        break_task_confirm = Gtk.Button(label="✓")
+        break_task_clear = Gtk.Button(label="×")
+        for button in (break_task_confirm, break_task_clear):
+            button.get_style_context().add_class("focus-tomato-task-icon")
+        break_task_confirm.connect("clicked", lambda _b: self._confirm_break_task(TaskOutcome.COMPLETED))
+        break_task_clear.connect("clicked", lambda _b: self._clear_break_task())
+        break_task_entry.connect("activate", lambda _e: self._confirm_break_task(TaskOutcome.COMPLETED))
+        break_task_entry.connect("changed", lambda entry: self._on_break_task_draft_changed(entry))
+        break_task_entry_row.pack_start(break_task_entry, True, True, 0)
+        break_task_entry_row.pack_start(break_task_confirm, False, False, 0)
+        break_task_entry_row.pack_start(break_task_clear, False, False, 0)
+        break_task_box.pack_start(break_task_entry_row, False, False, 0)
+        break_content.pack_start(break_task_box, False, False, 0)
         content.pack_start(break_content, False, False, 0)
 
         focus_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -356,6 +434,27 @@ class FocusTomatoApplication(Gtk.Application):
         start_button.connect("clicked", self._on_rest_screen_start_focus)
         focus_content.pack_start(focus_countdown, False, False, 0)
         focus_content.pack_start(start_button, False, False, 0)
+        focus_task_row = Gtk.Box(spacing=5)
+        focus_task_row.set_halign(Gtk.Align.CENTER)
+        focus_goal_plus = Gtk.Button(label="＋")
+        focus_goal_plus.get_style_context().add_class("focus-tomato-task-icon")
+        focus_goal_plus.connect("clicked", lambda _b: self._toggle_focus_goal_editor(True))
+        focus_task_row.pack_start(focus_goal_plus, False, False, 0)
+        focus_goal_entry = Gtk.Entry()
+        focus_goal_entry.set_max_length(20)
+        focus_goal_entry.set_placeholder_text("这次专注的目标")
+        focus_goal_entry.get_style_context().add_class("focus-tomato-task-entry")
+        focus_goal_confirm = Gtk.Button(label="✓")
+        focus_goal_clear = Gtk.Button(label="×")
+        for button in (focus_goal_confirm, focus_goal_clear):
+            button.get_style_context().add_class("focus-tomato-task-icon")
+        focus_goal_confirm.connect("clicked", lambda _b: self._confirm_focus_goal())
+        focus_goal_clear.connect("clicked", lambda _b: self._clear_focus_goal())
+        focus_goal_entry.connect("activate", lambda _e: self._confirm_focus_goal())
+        focus_task_row.pack_start(focus_goal_entry, True, True, 0)
+        focus_task_row.pack_start(focus_goal_confirm, False, False, 0)
+        focus_task_row.pack_start(focus_goal_clear, False, False, 0)
+        focus_content.pack_start(focus_task_row, False, False, 0)
         content.pack_start(focus_content, False, False, 0)
 
         lower_slot_size_group = Gtk.SizeGroup.new(Gtk.SizeGroupMode.VERTICAL)
@@ -379,6 +478,8 @@ class FocusTomatoApplication(Gtk.Application):
         background.show_all()
         focus_content.hide()
         focus_hint.hide()
+        focus_goal_entry.hide(); focus_goal_confirm.hide(); focus_goal_clear.hide()
+        break_task_entry_row.hide()
 
         self._rest_screen = window
         self._rest_screen_background = background
@@ -390,6 +491,18 @@ class FocusTomatoApplication(Gtk.Application):
         self._rest_screen_focus_countdown = focus_countdown
         self._rest_screen_focus_hint = focus_hint
         self._rest_screen_focus_button = start_button
+        self._focus_goal_plus = focus_goal_plus
+        self._focus_goal_entry = focus_goal_entry
+        self._focus_goal_confirm = focus_goal_confirm
+        self._focus_goal_clear = focus_goal_clear
+        self._break_task_label = break_task_label
+        self._break_task_plus = break_task_plus
+        self._break_task_entry = break_task_entry
+        self._break_task_confirm = break_task_confirm
+        self._break_task_clear = break_task_clear
+        self._break_task_entry_row = break_task_entry_row
+        self._break_task_completed = break_task_completed
+        self._break_task_incomplete = break_task_incomplete
         self._rest_screen_lower_slot_size_group = lower_slot_size_group
         return window
 
@@ -441,6 +554,13 @@ class FocusTomatoApplication(Gtk.Application):
             str(default_minutes),
             replace_on_input=True,
         )
+        goal = self.engine.next_goal if self.engine is not None else None
+        if goal:
+            assert self._focus_goal_entry is not None
+            self._focus_goal_entry.set_text(goal)
+            self._toggle_focus_goal_editor(True)
+        else:
+            self._toggle_focus_goal_editor(False)
         if self._rest_screen is not None:
             self._rest_screen.set_focus(None)
 
@@ -557,6 +677,112 @@ class FocusTomatoApplication(Gtk.Application):
             self._rest_screen_long_break_hint.show()
         else:
             self._rest_screen_long_break_hint.hide()
+        self._render_break_task(snapshot)
+
+    def _toggle_focus_goal_editor(self, expanded: bool) -> None:
+        if expanded == self._focus_goal_expanded:
+            return
+        self._focus_goal_expanded = expanded
+        for widget in (self._focus_goal_entry, self._focus_goal_confirm, self._focus_goal_clear):
+            if widget is not None:
+                self._animate_task_widget(widget, expanded)
+        if self._focus_goal_plus is not None:
+            self._focus_goal_plus.set_visible(not expanded)
+        if expanded and self._focus_goal_entry is not None:
+            self._focus_goal_entry.grab_focus()
+
+    def _confirm_focus_goal(self) -> None:
+        if self.engine is None:
+            return
+        goal = self._focus_goal_entry.get_text().strip()[:20] if self._focus_goal_entry else ""
+        self.engine.set_next_goal(goal or None)
+        if self._focus_goal_entry is not None:
+            self._focus_goal_entry.set_text(goal)
+        self._start_focus_from_rest_screen()
+
+    def _clear_focus_goal(self) -> None:
+        if self._focus_goal_entry is not None:
+            self._focus_goal_entry.set_text("")
+        if self.engine is not None:
+            self.engine.set_next_goal(None)
+        self._toggle_focus_goal_editor(False)
+
+    def _toggle_break_task_editor(self, expanded: bool) -> None:
+        was_expanded = self._break_task_expanded
+        if expanded == was_expanded:
+            return
+        self._break_task_expanded = expanded
+        if self._break_task_entry_row is not None:
+            self._animate_task_widget(self._break_task_entry_row, expanded)
+        if self._break_task_plus is not None:
+            self._break_task_plus.set_visible(not expanded)
+        if expanded and not was_expanded and self._break_task_entry is not None:
+            self._break_task_entry.grab_focus()
+
+    def _animate_task_widget(self, widget: Gtk.Widget, visible: bool) -> None:
+        """Use a short opacity/size transition for the plus-to-entry reveal."""
+        if visible:
+            widget.show()
+            widget.set_opacity(0.0)
+            step = {"value": 0}
+            def reveal() -> bool:
+                step["value"] += 1
+                widget.set_opacity(min(1.0, step["value"] / 6.0))
+                widget.set_size_request(42 + step["value"] * 42, -1)
+                return step["value"] < 6
+            GLib.timeout_add(25, reveal)
+        else:
+            widget.set_opacity(0.0)
+            widget.set_size_request(-1, -1)
+            widget.hide()
+
+    def _confirm_break_task(self, outcome: TaskOutcome) -> None:
+        if self.engine is None or not self.engine.snapshot.status.is_break:
+            return
+        text = self._break_task_entry.get_text() if self._break_task_entry else ""
+        if text.strip() or self.engine.snapshot.focus_goal:
+            self.engine.confirm_break_task(text, outcome)
+            self._toggle_break_task_editor(True)
+            if self._break_task_entry is not None:
+                self._break_task_entry.set_text(text.strip()[:20])
+            self._render()
+
+    def _on_break_task_draft_changed(self, entry: Gtk.Entry) -> None:
+        if self.engine is not None and self._break_task_expanded:
+            self.engine.set_break_task_draft(entry.get_text())
+
+    def _clear_break_task(self) -> None:
+        if self.engine is not None:
+            self.engine.clear_break_task()
+        if self._break_task_entry is not None:
+            self._break_task_entry.set_text("")
+        self._toggle_break_task_editor(False)
+        self._render()
+
+    def _render_break_task(self, snapshot: RuntimeSnapshot) -> None:
+        if self._break_task_label is None:
+            return
+        goal = snapshot.focus_goal
+        if snapshot.break_task and self._break_task_entry is not None:
+            if self._break_task_entry.get_text() != snapshot.break_task:
+                self._break_task_entry.set_text(snapshot.break_task)
+        if goal:
+            self._break_task_label.set_text(f"目标：{goal}")
+            self._break_task_label.show()
+            for button in (self._break_task_completed, self._break_task_incomplete):
+                if button is not None:
+                    button.show()
+            if self._break_task_plus is not None:
+                self._break_task_plus.hide()
+            self._toggle_break_task_editor(True)
+        else:
+            self._break_task_label.set_text("记录这次休息前完成的任务")
+            self._break_task_label.show()
+            for button in (self._break_task_completed, self._break_task_incomplete):
+                if button is not None:
+                    button.hide()
+            if not self._break_task_expanded:
+                self._toggle_break_task_editor(False)
 
     def _rest_screen_is_visible(self) -> bool:
         return self._rest_screen is not None and self._rest_screen.get_visible()
@@ -595,6 +821,13 @@ class FocusTomatoApplication(Gtk.Application):
         event: Gdk.EventKey,
     ) -> bool:
         if self._rest_screen_page == _REST_SCREEN_BREAK:
+            if event.keyval == Gdk.KEY_Escape:
+                self._close_rest_screen()
+                return True
+            if event.keyval in {Gdk.KEY_Return, Gdk.KEY_KP_Enter}:
+                if self._break_task_expanded:
+                    self._confirm_break_task(TaskOutcome.COMPLETED)
+                return True
             control_pressed = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
             if event.keyval == Gdk.KEY_space and control_pressed:
                 return True
@@ -612,9 +845,6 @@ class FocusTomatoApplication(Gtk.Application):
                     self.engine.adjust_break_minutes(adjustment)
                 )
                 self._render()
-                return True
-            if event.keyval not in _MODIFIER_KEYVALS:
-                self._close_rest_screen()
                 return True
             return False
 
@@ -638,7 +868,10 @@ class FocusTomatoApplication(Gtk.Application):
             self._adjust_rest_screen_focus_duration(adjustment)
             return True
         if keyval in {Gdk.KEY_Return, Gdk.KEY_KP_Enter}:
-            self._start_focus_from_rest_screen()
+            if self._focus_goal_expanded:
+                self._confirm_focus_goal()
+            else:
+                self._start_focus_from_rest_screen()
             return True
         if keyval in {Gdk.KEY_BackSpace, Gdk.KEY_Delete}:
             self._delete_rest_screen_focus_duration()
@@ -716,7 +949,8 @@ class FocusTomatoApplication(Gtk.Application):
         if minutes is None:
             return False
         self._recent_focus_minutes = minutes
-        self.engine.start_focus(minutes * 60)
+        goal = self._focus_goal_entry.get_text().strip()[:20] if self._focus_goal_expanded and self._focus_goal_entry else None
+        self.engine.start_focus(minutes * 60, goal=goal)
         self._close_rest_screen()
         self._render()
         return True

@@ -35,6 +35,12 @@ class TimerEvent(str, Enum):
     BREAK_COMPLETED = "break_completed"
 
 
+class TaskOutcome(str, Enum):
+    UNRECORDED = "unrecorded"
+    COMPLETED = "completed"
+    INCOMPLETE = "incomplete"
+
+
 @dataclass
 class RuntimeSnapshot:
     status: TimerStatus = TimerStatus.IDLE
@@ -54,6 +60,14 @@ class RuntimeSnapshot:
     # Persist the recommendation with the pending/running rest so reopening
     # the app never depends on reconstructing a transient completion event.
     long_break_recommended: bool = False
+    # Optional task metadata.  These fields are persisted so a restart does
+    # not discard a target or an unfinished break record.
+    focus_goal: str | None = None
+    next_goal: str | None = None
+    task_session_id: str | None = None
+    break_task: str | None = None
+    break_task_outcome: TaskOutcome = TaskOutcome.UNRECORDED
+    break_task_confirmed: bool = False
 
 
 @dataclass(frozen=True)

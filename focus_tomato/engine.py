@@ -20,7 +20,8 @@ from .time_utils import local_day, split_duration_by_local_day
 # record.  This deliberately applies to both naturally completed and manually
 # ended focuses.  Paused time does not count.
 MINIMUM_RECORDED_FOCUS_MS = 5 * 60_000
-CONTINUOUS_FOCUS_WINDOW_MS = 3 * 60 * 60_000
+CONTINUOUS_BREAK_WINDOW_MS = 20 * 60_000
+MAXIMUM_BREAK_MS = 24 * 60 * 60_000
 
 
 class TimerEngine:
@@ -44,16 +45,19 @@ class TimerEngine:
             int,
             store.load_current_focus_pending(),
         )
-        self._recent_cycle_focus_starts = list(store.load_cycle_focus_starts())
+        self._recent_cycle_focus_intervals = list(
+            store.load_cycle_focus_intervals()
+        )
         self._trim_cycle_focus_history()
-        # Older releases only persisted a count.  It provides no evidence for
-        # the three-hour continuity rule, so never let it contribute to a new
-        # long-break decision after upgrading.
+        # Older releases persisted only starts. They cannot prove the complete
+        # between-focus gaps required by the new recommendation rule.
         needs_cycle_migration = (
             self._snapshot.completed_in_cycle
-            != len(self._recent_cycle_focus_starts)
+            != len(self._recent_cycle_focus_intervals)
         )
-        self._snapshot.completed_in_cycle = len(self._recent_cycle_focus_starts)
+        self._snapshot.completed_in_cycle = len(
+            self._recent_cycle_focus_intervals
+        )
         self._anchor_monotonic_ms = now_monotonic_ms
         self._anchor_wall_ms = now_wall_ms
         self.recovered = False
@@ -91,27 +95,35 @@ class TimerEngine:
 
     def set_config(self, config: TimerConfig) -> None:
         self.config = config
+        self._trim_cycle_focus_history()
+        self._snapshot.completed_in_cycle = len(
+            self._recent_cycle_focus_intervals
+        )
+        self._commit()
 
     def _cycle_history_limit(self) -> int:
         return max(0, self.config.sessions_before_long_break - 1)
 
     def _trim_cycle_focus_history(self) -> None:
-        """Keep exactly the starts that can still precede the next focus."""
+        """Keep exactly the completed focuses that can precede the next one."""
         limit = self._cycle_history_limit()
         if limit == 0:
-            self._recent_cycle_focus_starts.clear()
+            self._recent_cycle_focus_intervals.clear()
         else:
-            self._recent_cycle_focus_starts = self._recent_cycle_focus_starts[-limit:]
+            self._recent_cycle_focus_intervals = (
+                self._recent_cycle_focus_intervals[-limit:]
+            )
 
     def _set_idle(self) -> None:
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.IDLE,
             remaining_ms=0,
-            completed_in_cycle=len(self._recent_cycle_focus_starts),
+            completed_in_cycle=len(self._recent_cycle_focus_intervals),
             break_kind=None,
             phase_total_ms=0,
             break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
+            long_break_recommended=False,
         )
 
     def _reset_anchors(self) -> None:
@@ -146,95 +158,102 @@ class TimerEngine:
             completion_days or (),
             updated_at_wall_ms=self.clock.wall_epoch_ms(),
             current_focus_pending=persisted_pending,
-            recent_cycle_focus_starts=self._recent_cycle_focus_starts,
+            recent_cycle_focus_intervals=self._recent_cycle_focus_intervals,
         )
         if finalize_current_focus or discard_current_focus:
             self._pending_focus.clear()
 
-    def _break_kind_after_qualified_focus(
+    def _recommend_long_break_after_qualified_focus(
         self,
         completion_wall_ms: int,
-    ) -> BreakKind:
-        """Update the rolling qualified-focus history and select its break.
-
-        The stored timestamps are focus *starts*.  Four starts plus the fourth
-        completion must fit in three hours to form one continuous work block.
-        A legacy active focus has no reliable start timestamp, so it safely
-        breaks (rather than guesses at) an existing streak.
-        """
+    ) -> bool:
+        """Update completed-focus history and evaluate the rolling gap rule."""
         focus_started_at_wall_ms = self._snapshot.focus_started_at_wall_ms
-        if focus_started_at_wall_ms is None:
-            self._recent_cycle_focus_starts.clear()
-            return BreakKind.SHORT
+        if (
+            focus_started_at_wall_ms is None
+            or focus_started_at_wall_ms > completion_wall_ms
+        ):
+            self._recent_cycle_focus_intervals.clear()
+            return False
 
-        # Wall-clock corrections must not make a future timestamp appear
-        # continuous.  Old starts beyond the window cannot help a later focus.
-        recent_starts = [
-            start_ms
-            for start_ms in self._recent_cycle_focus_starts
-            if 0 <= completion_wall_ms - start_ms <= CONTINUOUS_FOCUS_WINDOW_MS
+        if (
+            self._recent_cycle_focus_intervals
+            and focus_started_at_wall_ms
+            < self._recent_cycle_focus_intervals[-1][1]
+        ):
+            # A backwards wall-clock correction must not manufacture a
+            # negative break interval that looks like uninterrupted work.
+            self._recent_cycle_focus_intervals.clear()
+
+        candidates = [
+            *self._recent_cycle_focus_intervals,
+            (focus_started_at_wall_ms, completion_wall_ms),
         ]
-        if focus_started_at_wall_ms > completion_wall_ms:
-            # Keep a clock correction from manufacturing a negative span.
-            focus_started_at_wall_ms = completion_wall_ms
-        candidates = [*recent_starts, focus_started_at_wall_ms]
         required_sessions = self.config.sessions_before_long_break
+        recommendation = False
         if len(candidates) >= required_sessions:
-            earliest_start_ms = candidates[-required_sessions]
-            span_ms = completion_wall_ms - earliest_start_ms
-            if 0 <= span_ms <= CONTINUOUS_FOCUS_WINDOW_MS:
-                self._recent_cycle_focus_starts.clear()
-                return BreakKind.LONG
+            recent = candidates[-required_sessions:]
+            gaps = [
+                current_start_ms - previous_completion_ms
+                for (_, previous_completion_ms), (current_start_ms, _)
+                in zip(recent, recent[1:])
+            ]
+            recommendation = (
+                all(gap_ms >= 0 for gap_ms in gaps)
+                and sum(gaps) <= CONTINUOUS_BREAK_WINDOW_MS
+            )
 
         limit = self._cycle_history_limit()
-        self._recent_cycle_focus_starts = (
+        self._recent_cycle_focus_intervals = (
             candidates[-limit:] if limit else []
         )
-        return BreakKind.SHORT
+        return recommendation
 
     def _complete_focus(
         self,
         completion_wall_ms: int,
     ) -> tuple[TimerEvent | None, str | None]:
         if self._focus_elapsed_ms() < MINIMUM_RECORDED_FOCUS_MS:
+            self._recent_cycle_focus_intervals.clear()
             self._set_idle()
             return None, None
 
         completion_day = local_day(completion_wall_ms)
-        kind = self._break_kind_after_qualified_focus(completion_wall_ms)
-        if kind is BreakKind.LONG:
-            break_seconds = self.config.long_break_seconds
-        else:
-            break_seconds = self.config.short_break_seconds
+        recommendation = self._recommend_long_break_after_qualified_focus(
+            completion_wall_ms
+        )
+        break_seconds = self.config.short_break_seconds
 
         self._snapshot = RuntimeSnapshot(
-            status=TimerStatus.BREAK_RUNNING,
+            status=TimerStatus.BREAK_READY,
             remaining_ms=break_seconds * 1000,
-            completed_in_cycle=len(self._recent_cycle_focus_starts),
-            break_kind=kind,
+            completed_in_cycle=len(self._recent_cycle_focus_intervals),
+            break_kind=None,
             phase_total_ms=break_seconds * 1000,
-            break_deadline_wall_ms=completion_wall_ms + break_seconds * 1000,
+            break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
+            long_break_recommended=recommendation,
         )
         return TimerEvent.FOCUS_COMPLETED, completion_day
 
     def _focus_elapsed_ms(self) -> int:
         return max(0, self._snapshot.phase_total_ms - self._snapshot.remaining_ms)
 
-    def _start_break_for_early_focus_end(
+    def _prepare_break_for_early_focus_end(
         self,
         actual_focus_ms: int,
-        start_wall_ms: int,
     ) -> None:
         break_ms = actual_focus_ms // 5
+        self._recent_cycle_focus_intervals.clear()
         self._snapshot = RuntimeSnapshot(
-            status=TimerStatus.BREAK_RUNNING,
+            status=TimerStatus.BREAK_READY,
             remaining_ms=break_ms,
-            completed_in_cycle=len(self._recent_cycle_focus_starts),
-            break_kind=BreakKind.SHORT,
+            completed_in_cycle=0,
+            break_kind=None,
             phase_total_ms=break_ms,
-            break_deadline_wall_ms=start_wall_ms + break_ms,
+            break_deadline_wall_ms=None,
             focus_started_at_wall_ms=None,
+            long_break_recommended=False,
         )
 
     def _complete_break(self) -> TimerEvent:
@@ -327,7 +346,7 @@ class TimerEngine:
         self._snapshot = RuntimeSnapshot(
             status=TimerStatus.FOCUS_RUNNING,
             remaining_ms=focus_seconds * 1000,
-            completed_in_cycle=len(self._recent_cycle_focus_starts),
+            completed_in_cycle=len(self._recent_cycle_focus_intervals),
             break_kind=None,
             phase_total_ms=focus_seconds * 1000,
             break_deadline_wall_ms=None,
@@ -357,15 +376,56 @@ class TimerEngine:
         if self._snapshot.status.is_focus:
             actual_focus_ms = self._focus_elapsed_ms()
             if actual_focus_ms < MINIMUM_RECORDED_FOCUS_MS:
+                self._recent_cycle_focus_intervals.clear()
                 self._set_idle()
                 self._commit(discard_current_focus=True)
             else:
-                self._start_break_for_early_focus_end(
-                    actual_focus_ms,
-                    self.clock.wall_epoch_ms(),
-                )
+                self._prepare_break_for_early_focus_end(actual_focus_ms)
                 events.append(TimerEvent.FOCUS_ENDED_EARLY)
                 self._commit(finalize_current_focus=True)
+        return events
+
+    def start_break(self) -> bool:
+        if self._snapshot.status is not TimerStatus.BREAK_READY:
+            return False
+        now_wall_ms = self.clock.wall_epoch_ms()
+        self._snapshot.status = TimerStatus.BREAK_RUNNING
+        self._snapshot.break_kind = BreakKind.SHORT
+        self._snapshot.break_deadline_wall_ms = (
+            now_wall_ms + self._snapshot.remaining_ms
+        )
+        self._commit()
+        return True
+
+    def skip_break(self) -> bool:
+        if self._snapshot.status is not TimerStatus.BREAK_READY:
+            return False
+        self._set_idle()
+        self._commit()
+        return True
+
+    def adjust_break_minutes(self, adjustment: int) -> list[TimerEvent]:
+        events = self._advance()
+        if self._snapshot.status is not TimerStatus.BREAK_RUNNING:
+            return events
+        delta_ms = int(adjustment) * 60_000
+        if delta_ms == 0:
+            return events
+        remaining_ms = self._snapshot.remaining_ms + delta_ms
+        phase_total_ms = self._snapshot.phase_total_ms + delta_ms
+        if (
+            remaining_ms <= 0
+            or phase_total_ms <= 0
+            or phase_total_ms > MAXIMUM_BREAK_MS
+        ):
+            return events
+        deadline_ms = self._snapshot.break_deadline_wall_ms
+        if deadline_ms is None:
+            deadline_ms = self.clock.wall_epoch_ms() + self._snapshot.remaining_ms
+        self._snapshot.remaining_ms = remaining_ms
+        self._snapshot.phase_total_ms = phase_total_ms
+        self._snapshot.break_deadline_wall_ms = deadline_ms + delta_ms
+        self._commit()
         return events
 
     def end_break(self) -> list[TimerEvent]:

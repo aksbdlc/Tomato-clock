@@ -8,6 +8,7 @@ class TimerStatus(str, Enum):
     IDLE = "idle"
     FOCUS_RUNNING = "focus_running"
     FOCUS_PAUSED = "focus_paused"
+    BREAK_READY = "break_ready"
     BREAK_RUNNING = "break_running"
 
     @property
@@ -50,6 +51,9 @@ class RuntimeSnapshot:
     # application restarts; remaining focus time remains monotonic-clock
     # driven.
     focus_started_at_wall_ms: int | None = None
+    # Persist the recommendation with the pending/running rest so reopening
+    # the app never depends on reconstructing a transient completion event.
+    long_break_recommended: bool = False
 
 
 @dataclass(frozen=True)

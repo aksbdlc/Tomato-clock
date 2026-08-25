@@ -102,7 +102,7 @@ class TimerEngineTest(unittest.TestCase):
         self.assertEqual(self.store.load_cycle_focus_starts(), ())
         self.assertEqual(self.store.load_current_focus_pending(), {})
 
-    def test_early_end_at_five_minutes_records_focus_and_starts_short_break(self) -> None:
+    def test_early_end_at_five_minutes_records_focus_and_prepares_short_break(self) -> None:
         self.engine.start_focus(duration_seconds=10 * 60)
         self.clock.advance(5 * 60_000)
 
@@ -112,15 +112,12 @@ class TimerEngineTest(unittest.TestCase):
         )
 
         snapshot = self.engine.snapshot
-        self.assertEqual(snapshot.status, TimerStatus.BREAK_RUNNING)
+        self.assertEqual(snapshot.status, TimerStatus.BREAK_READY)
         self.assertEqual(snapshot.remaining_ms, 60_000)
         self.assertEqual(snapshot.phase_total_ms, 60_000)
-        self.assertEqual(snapshot.break_kind, BreakKind.SHORT)
+        self.assertIsNone(snapshot.break_kind)
         self.assertEqual(snapshot.completed_in_cycle, 0)
-        self.assertEqual(
-            snapshot.break_deadline_wall_ms,
-            self.clock.wall_epoch_ms() + 60_000,
-        )
+        self.assertIsNone(snapshot.break_deadline_wall_ms)
         self.assertEqual(self.engine.today_stats().focus_ms, 5 * 60_000)
         self.assertEqual(self.engine.today_stats().completed_sessions, 0)
         self.assertEqual(self.store.load_current_focus_pending(), {})
@@ -155,12 +152,12 @@ class TimerEngineTest(unittest.TestCase):
         self.assertEqual(self.engine.today_stats().focus_ms, 305_000)
         self.assertEqual(self.engine.today_stats().completed_sessions, 0)
 
-    def test_qualified_early_end_does_not_change_the_continuous_long_break_cycle(self) -> None:
+    def test_qualified_early_end_breaks_the_recommendation_chain(self) -> None:
         for _ in range(3):
             self.engine.start_focus()
             self.clock.advance(5 * 60_000)
             self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-            self.assertEqual(self.engine.end_break(), [])
+            self.assertTrue(self.engine.skip_break())
 
         self.assertEqual(self.engine.snapshot.completed_in_cycle, 3)
         self.engine.start_focus(duration_seconds=10 * 60)
@@ -170,16 +167,16 @@ class TimerEngineTest(unittest.TestCase):
             self.engine.end_focus(),
             [TimerEvent.FOCUS_ENDED_EARLY],
         )
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.SHORT)
-        self.assertEqual(self.engine.snapshot.completed_in_cycle, 3)
+        self.assertIsNone(self.engine.snapshot.break_kind)
+        self.assertEqual(self.engine.snapshot.completed_in_cycle, 0)
         self.assertEqual(self.engine.today_stats().completed_sessions, 3)
 
-        self.assertEqual(self.engine.end_break(), [])
+        self.assertTrue(self.engine.skip_break())
         self.engine.start_focus()
         self.clock.advance(5 * 60_000)
         self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.LONG)
-        self.assertEqual(self.engine.snapshot.completed_in_cycle, 0)
+        self.assertFalse(self.engine.snapshot.long_break_recommended)
+        self.assertEqual(self.engine.snapshot.completed_in_cycle, 1)
         self.assertEqual(self.engine.today_stats().completed_sessions, 4)
 
     def test_early_end_across_midnight_finalizes_each_day_without_completion(self) -> None:
@@ -269,7 +266,7 @@ class TimerEngineTest(unittest.TestCase):
                 [TimerEvent.FOCUS_ENDED_EARLY],
             )
             snapshot = recovered.snapshot
-            self.assertEqual(snapshot.status, TimerStatus.BREAK_RUNNING)
+            self.assertEqual(snapshot.status, TimerStatus.BREAK_READY)
             self.assertEqual(snapshot.remaining_ms, 61_000)
             self.assertEqual(snapshot.completed_in_cycle, 0)
             self.assertEqual(second_store.stats_for_day("2026-02-01").focus_ms, 305_000)
@@ -284,16 +281,16 @@ class TimerEngineTest(unittest.TestCase):
         self.clock.advance(5 * 60_000)
 
         self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_RUNNING)
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.SHORT)
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_READY)
+        self.assertIsNone(self.engine.snapshot.break_kind)
 
         stats = self.engine.today_stats()
         self.assertEqual(stats.focus_ms, 5 * 60_000)
         self.assertEqual(stats.completed_sessions, 1)
         self.assertEqual(self.engine.snapshot.completed_in_cycle, 1)
         self.assertEqual(
-            self.store.load_cycle_focus_starts(),
-            (local_epoch_ms(2026, 1, 15, 9, 0),),
+            self.store.load_cycle_focus_intervals(),
+            ((local_epoch_ms(2026, 1, 15, 9, 0), self.clock.wall_epoch_ms()),),
         )
 
         # Re-rendering/ticking at the same instant must not double count.
@@ -358,7 +355,26 @@ class TimerEngineTest(unittest.TestCase):
         self.clock.advance(268_000, wall_elapsed_ms=1_000)
         self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
 
-    def test_four_qualified_natural_focuses_within_three_hours_use_a_long_break(self) -> None:
+    def test_waiting_does_not_consume_break_and_click_starts_full_duration(self) -> None:
+        self.engine.start_focus()
+        self.clock.advance(5 * 60_000)
+        self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
+
+        self.clock.advance(7 * 60_000)
+        self.assertEqual(self.engine.tick(), [])
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_READY)
+        self.assertEqual(self.engine.snapshot.remaining_ms, 10_000)
+        self.assertIsNone(self.engine.snapshot.break_deadline_wall_ms)
+
+        self.assertTrue(self.engine.start_break())
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_RUNNING)
+        self.assertEqual(
+            self.engine.snapshot.break_deadline_wall_ms,
+            self.clock.wall_epoch_ms() + 10_000,
+        )
+
+    def test_four_focuses_with_twenty_minutes_of_gaps_recommend_long_break(self) -> None:
+        gaps = (5 * 60_000, 5 * 60_000, 10 * 60_000)
         for session_number in range(1, 5):
             with self.subTest(session=session_number):
                 self.engine.start_focus()
@@ -366,81 +382,78 @@ class TimerEngineTest(unittest.TestCase):
                 self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
 
                 snapshot = self.engine.snapshot
-                expected_kind = BreakKind.LONG if session_number == 4 else BreakKind.SHORT
-                expected_duration = 30_000 if session_number == 4 else 10_000
-                expected_cycle = 0 if session_number == 4 else session_number
-                self.assertEqual(snapshot.status, TimerStatus.BREAK_RUNNING)
-                self.assertEqual(snapshot.break_kind, expected_kind)
-                self.assertEqual(snapshot.remaining_ms, expected_duration)
-                self.assertEqual(snapshot.completed_in_cycle, expected_cycle)
-
-                self.clock.advance(expected_duration)
-                self.assertEqual(self.engine.tick(), [TimerEvent.BREAK_COMPLETED])
-                self.assertEqual(self.engine.snapshot.status, TimerStatus.IDLE)
-                self.assertIsNone(self.engine.snapshot.break_kind)
+                self.assertEqual(snapshot.status, TimerStatus.BREAK_READY)
+                self.assertIsNone(snapshot.break_kind)
+                self.assertEqual(snapshot.remaining_ms, 10_000)
+                self.assertEqual(
+                    snapshot.long_break_recommended,
+                    session_number == 4,
+                )
+                if session_number < 4:
+                    self.assertTrue(self.engine.skip_break())
+                    self.clock.advance(gaps[session_number - 1])
 
         stats = self.engine.today_stats()
         self.assertEqual(stats.completed_sessions, 4)
         self.assertEqual(stats.focus_ms, 4 * 5 * 60_000)
 
-    def test_four_qualified_focuses_ending_at_exactly_three_hours_use_a_long_break(self) -> None:
-        # Starts are 0, 60, 120 and 175 minutes after the initial wall time;
-        # the fourth five-minute focus completes exactly three hours after the
-        # first one started.  The boundary is intentionally inclusive.
-        for idle_gap_ms in (55 * 60_000, 55 * 60_000, 50 * 60_000):
+    def test_gap_total_over_twenty_minutes_does_not_recommend(self) -> None:
+        for gap_ms in (5 * 60_000, 5 * 60_000, 10 * 60_000 + 1):
             self.engine.start_focus()
             self.clock.advance(5 * 60_000)
             self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-            self.assertEqual(self.engine.snapshot.break_kind, BreakKind.SHORT)
-            self.assertEqual(self.engine.end_break(), [])
-            self.clock.advance(idle_gap_ms)
+            self.assertTrue(self.engine.skip_break())
+            self.clock.advance(gap_ms)
 
         self.engine.start_focus()
         self.clock.advance(5 * 60_000)
         self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.LONG)
-        self.assertEqual(self.engine.snapshot.completed_in_cycle, 0)
+        self.assertFalse(self.engine.snapshot.long_break_recommended)
 
-    def test_focuses_spanning_over_three_hours_roll_forward_before_long_break(self) -> None:
-        # The fourth completion is 185 minutes after the first start.  It must
-        # not trigger long rest; it replaces the expired first entry, allowing
-        # the next qualified focus to form a new four-focus continuous block.
-        for idle_gap_ms in (55 * 60_000, 55 * 60_000, 55 * 60_000):
+    def test_waiting_for_rest_is_included_in_the_gap_total(self) -> None:
+        for session_number in range(1, 5):
             self.engine.start_focus()
             self.clock.advance(5 * 60_000)
             self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-            self.assertEqual(self.engine.snapshot.break_kind, BreakKind.SHORT)
-            self.assertEqual(self.engine.end_break(), [])
-            self.clock.advance(idle_gap_ms)
+            if session_number < 4:
+                self.clock.advance(7 * 60_000)
+                self.assertTrue(self.engine.skip_break())
 
-        self.engine.start_focus()
-        self.clock.advance(5 * 60_000)
-        self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.SHORT)
-        self.assertEqual(self.engine.snapshot.completed_in_cycle, 3)
-        self.assertEqual(self.engine.end_break(), [])
+        self.assertFalse(self.engine.snapshot.long_break_recommended)
 
-        self.engine.start_focus()
-        self.clock.advance(5 * 60_000)
-        self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(self.engine.snapshot.break_kind, BreakKind.LONG)
-        self.assertEqual(self.engine.snapshot.completed_in_cycle, 0)
+    def test_fifth_and_sixth_focuses_keep_using_rolling_recommendation(self) -> None:
+        recommendations: list[bool] = []
+        for session_number in range(1, 7):
+            self.engine.start_focus()
+            self.clock.advance(5 * 60_000)
+            self.assertEqual(self.engine.tick(), [TimerEvent.FOCUS_COMPLETED])
+            recommendations.append(self.engine.snapshot.long_break_recommended)
+            if session_number < 6:
+                self.assertTrue(self.engine.skip_break())
+                self.clock.advance(60_000)
 
-    def test_elapsed_time_can_complete_focus_and_break_in_one_tick(self) -> None:
+        self.assertEqual(
+            recommendations,
+            [False, False, False, True, True, True],
+        )
+
+    def test_elapsed_time_cannot_consume_a_break_before_it_is_started(self) -> None:
         self.engine.start_focus()
         self.clock.advance(5 * 60_000 + 10_000)
 
         self.assertEqual(
             self.engine.tick(),
-            [TimerEvent.FOCUS_COMPLETED, TimerEvent.BREAK_COMPLETED],
+            [TimerEvent.FOCUS_COMPLETED],
         )
-        self.assertEqual(self.engine.snapshot.status, TimerStatus.IDLE)
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_READY)
+        self.assertEqual(self.engine.snapshot.remaining_ms, 10_000)
         self.assertEqual(self.engine.today_stats().completed_sessions, 1)
 
     def test_ending_break_returns_to_idle_without_changing_focus_stats(self) -> None:
         self.engine.start_focus()
         self.clock.advance(5 * 60_000)
         self.engine.tick()
+        self.assertTrue(self.engine.start_break())
         before = self.engine.today_stats()
 
         self.clock.advance(4_000)
@@ -471,6 +484,7 @@ class TimerEngineTest(unittest.TestCase):
         self.engine.start_focus()
         self.clock.advance(5 * 60_000)
         self.engine.tick()
+        self.assertTrue(self.engine.start_break())
         self.clock.advance(4_000)
 
         self.assertEqual(self.engine.pause_for_sleep(), [])
@@ -516,7 +530,7 @@ class TimerEngineTest(unittest.TestCase):
             recovered.tick()
             self.assertEqual(recovered.snapshot.remaining_ms, 281_000)
 
-    def test_qualified_focus_history_survives_restart_and_finishes_the_cycle(self) -> None:
+    def test_qualified_focus_history_survives_restart_and_recommends(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database = Path(temp_dir) / "timer.db"
             first_store = SQLiteStore(database)
@@ -527,12 +541,18 @@ class TimerEngineTest(unittest.TestCase):
                 first_engine.start_focus()
                 first_clock.advance(5 * 60_000)
                 self.assertEqual(first_engine.tick(), [TimerEvent.FOCUS_COMPLETED])
-                self.assertEqual(first_engine.end_break(), [])
+                self.assertTrue(first_engine.skip_break())
 
             initial_wall_ms = local_epoch_ms(2026, 2, 1, 8, 0)
             self.assertEqual(
-                first_store.load_cycle_focus_starts(),
-                (initial_wall_ms, initial_wall_ms + 5 * 60_000),
+                first_store.load_cycle_focus_intervals(),
+                (
+                    (initial_wall_ms, initial_wall_ms + 5 * 60_000),
+                    (
+                        initial_wall_ms + 5 * 60_000,
+                        initial_wall_ms + 10 * 60_000,
+                    ),
+                ),
             )
             first_store.close()
 
@@ -544,27 +564,36 @@ class TimerEngineTest(unittest.TestCase):
             self.assertFalse(recovered.recovered)
             self.assertEqual(recovered.snapshot.completed_in_cycle, 2)
             self.assertEqual(
-                second_store.load_cycle_focus_starts(),
-                (initial_wall_ms, initial_wall_ms + 5 * 60_000),
+                second_store.load_cycle_focus_intervals(),
+                (
+                    (initial_wall_ms, initial_wall_ms + 5 * 60_000),
+                    (
+                        initial_wall_ms + 5 * 60_000,
+                        initial_wall_ms + 10 * 60_000,
+                    ),
+                ),
             )
 
             recovered.start_focus()
             second_clock.advance(5 * 60_000)
             self.assertEqual(recovered.tick(), [TimerEvent.FOCUS_COMPLETED])
-            self.assertEqual(recovered.snapshot.break_kind, BreakKind.SHORT)
-            self.assertEqual(recovered.end_break(), [])
+            self.assertFalse(recovered.snapshot.long_break_recommended)
+            self.assertTrue(recovered.skip_break())
 
             recovered.start_focus()
             second_clock.advance(5 * 60_000)
             self.assertEqual(recovered.tick(), [TimerEvent.FOCUS_COMPLETED])
-            self.assertEqual(recovered.snapshot.break_kind, BreakKind.LONG)
-            self.assertEqual(recovered.snapshot.completed_in_cycle, 0)
-            self.assertEqual(second_store.load_cycle_focus_starts(), ())
+            self.assertTrue(recovered.snapshot.long_break_recommended)
+            self.assertEqual(recovered.snapshot.completed_in_cycle, 3)
+            self.assertEqual(len(second_store.load_cycle_focus_intervals()), 3)
 
     def test_legacy_completed_cycle_count_without_timestamps_is_safely_cleared(self) -> None:
         store = SQLiteStore(":memory:")
         self.addCleanup(store.close)
-        store.commit(RuntimeSnapshot(completed_in_cycle=3))
+        store.commit(
+            RuntimeSnapshot(completed_in_cycle=3),
+            recent_cycle_focus_starts=(100, 200, 300),
+        )
         clock = FakeClock(wall_ms=local_epoch_ms(2026, 2, 1, 8, 0))
 
         migrated = TimerEngine(store, self.config, clock)
@@ -576,8 +605,98 @@ class TimerEngineTest(unittest.TestCase):
         migrated.start_focus()
         clock.advance(5 * 60_000)
         self.assertEqual(migrated.tick(), [TimerEvent.FOCUS_COMPLETED])
-        self.assertEqual(migrated.snapshot.break_kind, BreakKind.SHORT)
+        self.assertIsNone(migrated.snapshot.break_kind)
         self.assertEqual(migrated.snapshot.completed_in_cycle, 1)
+
+    def test_pending_break_survives_restart_without_losing_time(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Path(temp_dir) / "timer.db"
+            first_store = SQLiteStore(database)
+            first_clock = FakeClock(wall_ms=local_epoch_ms(2026, 2, 1, 8, 0))
+            first_engine = TimerEngine(first_store, self.config, first_clock)
+            first_engine.start_focus()
+            first_clock.advance(5 * 60_000)
+            self.assertEqual(first_engine.tick(), [TimerEvent.FOCUS_COMPLETED])
+            first_store.close()
+
+            second_store = SQLiteStore(database)
+            self.addCleanup(second_store.close)
+            second_clock = FakeClock(wall_ms=first_clock.wall_epoch_ms() + 60 * 60_000)
+            recovered = TimerEngine(second_store, self.config, second_clock)
+
+            self.assertEqual(recovered.snapshot.status, TimerStatus.BREAK_READY)
+            self.assertEqual(recovered.snapshot.remaining_ms, 10_000)
+            self.assertIsNone(recovered.snapshot.break_deadline_wall_ms)
+            self.assertTrue(recovered.start_break())
+            self.assertEqual(
+                recovered.snapshot.break_deadline_wall_ms,
+                second_clock.wall_epoch_ms() + 10_000,
+            )
+
+    def test_pending_break_blocks_focus_until_explicit_skip(self) -> None:
+        self.engine.start_focus()
+        self.clock.advance(5 * 60_000)
+        self.engine.tick()
+
+        self.engine.start_focus()
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.BREAK_READY)
+        self.assertTrue(self.engine.skip_break())
+        self.engine.start_focus()
+        self.assertEqual(self.engine.snapshot.status, TimerStatus.FOCUS_RUNNING)
+
+    def test_running_break_adjustments_update_deadline_and_total(self) -> None:
+        self.engine.start_focus()
+        self.clock.advance(5 * 60_000)
+        self.engine.tick()
+        self.assertTrue(self.engine.start_break())
+        original_deadline = self.engine.snapshot.break_deadline_wall_ms
+        self.assertIsNotNone(original_deadline)
+
+        self.assertEqual(self.engine.adjust_break_minutes(1), [])
+        self.assertEqual(self.engine.snapshot.remaining_ms, 70_000)
+        self.assertEqual(self.engine.snapshot.phase_total_ms, 70_000)
+        self.assertEqual(
+            self.engine.snapshot.break_deadline_wall_ms,
+            original_deadline + 60_000,
+        )
+
+        self.assertEqual(self.engine.adjust_break_minutes(-1), [])
+        self.assertEqual(self.engine.snapshot.remaining_ms, 10_000)
+        unchanged = self.engine.snapshot
+        self.assertEqual(self.engine.adjust_break_minutes(-1), [])
+        self.assertEqual(self.engine.snapshot, unchanged)
+
+    def test_running_break_cannot_be_extended_past_one_day(self) -> None:
+        config = TimerConfig(
+            focus_seconds=5 * 60,
+            short_break_seconds=24 * 60 * 60,
+            long_break_seconds=30 * 60,
+            sessions_before_long_break=4,
+        )
+        engine = TimerEngine(self.store, config, self.clock)
+        engine.start_focus()
+        self.clock.advance(5 * 60_000)
+        engine.tick()
+        self.assertTrue(engine.start_break())
+        unchanged = engine.snapshot
+
+        self.assertEqual(engine.adjust_break_minutes(1), [])
+        self.assertEqual(engine.snapshot, unchanged)
+
+    def test_backwards_wall_clock_breaks_recommendation_chain(self) -> None:
+        for _ in range(3):
+            self.engine.start_focus()
+            self.clock.advance(5 * 60_000)
+            self.engine.tick()
+            self.assertTrue(self.engine.skip_break())
+
+        self.clock.adjust_wall(-60 * 60_000)
+        self.engine.start_focus()
+        self.clock.advance(5 * 60_000)
+        self.engine.tick()
+
+        self.assertFalse(self.engine.snapshot.long_break_recommended)
+        self.assertEqual(self.engine.snapshot.completed_in_cycle, 1)
 
     def test_running_break_continues_after_restart_by_wall_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

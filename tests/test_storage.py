@@ -24,13 +24,14 @@ class SQLiteStoreTest(unittest.TestCase):
                     phase_total_ms=30_000,
                     break_deadline_wall_ms=1_800_000_000_000,
                     focus_started_at_wall_ms=None,
+                    long_break_recommended=True,
                 ),
                 {"2026-05-01": 61_000, "2026-05-02": 2_000},
                 ("2026-05-01", "2026-05-01"),
-                recent_cycle_focus_starts=(
-                    1_799_999_000_000,
-                    1_799_999_500_000,
-                    1_799_999_750_000,
+                recent_cycle_focus_intervals=(
+                    (1_799_999_000_000, 1_799_999_100_000),
+                    (1_799_999_500_000, 1_799_999_600_000),
+                    (1_799_999_750_000, 1_799_999_800_000),
                 ),
             )
             first.close()
@@ -47,11 +48,16 @@ class SQLiteStoreTest(unittest.TestCase):
                     phase_total_ms=30_000,
                     break_deadline_wall_ms=1_800_000_000_000,
                     focus_started_at_wall_ms=None,
+                    long_break_recommended=True,
                 ),
             )
             self.assertEqual(
-                second.load_cycle_focus_starts(),
-                (1_799_999_000_000, 1_799_999_500_000, 1_799_999_750_000),
+                second.load_cycle_focus_intervals(),
+                (
+                    (1_799_999_000_000, 1_799_999_100_000),
+                    (1_799_999_500_000, 1_799_999_600_000),
+                    (1_799_999_750_000, 1_799_999_800_000),
+                ),
             )
             self.assertEqual(second.stats_for_day("2026-05-01").focus_ms, 61_000)
             self.assertEqual(
@@ -202,7 +208,22 @@ class SQLiteStoreTest(unittest.TestCase):
             self.assertEqual(snapshot.remaining_ms, 42_000)
             self.assertEqual(snapshot.phase_total_ms, 42_000)
             self.assertIsNone(snapshot.focus_started_at_wall_ms)
+            self.assertFalse(snapshot.long_break_recommended)
             self.assertEqual(store.load_cycle_focus_starts(), ())
+            runtime_columns = {
+                row[1]
+                for row in store.connection.execute(
+                    "PRAGMA table_info(runtime_state)"
+                )
+            }
+            cycle_columns = {
+                row[1]
+                for row in store.connection.execute(
+                    "PRAGMA table_info(recent_cycle_focus_starts)"
+                )
+            }
+            self.assertIn("long_break_recommended", runtime_columns)
+            self.assertIn("completed_at_wall_ms", cycle_columns)
             self.assertEqual(
                 store.stats_for_day("2026-06-01").focus_ms,
                 120_000,
@@ -226,6 +247,21 @@ class SQLiteStoreTest(unittest.TestCase):
 
         self.assertEqual(store.load_runtime(), snapshot)
 
+    def test_runtime_persists_pending_break_and_recommendation(self) -> None:
+        store = SQLiteStore(":memory:")
+        self.addCleanup(store.close)
+        snapshot = RuntimeSnapshot(
+            status=TimerStatus.BREAK_READY,
+            remaining_ms=5 * 60_000,
+            completed_in_cycle=3,
+            phase_total_ms=5 * 60_000,
+            long_break_recommended=True,
+        )
+
+        store.commit(snapshot)
+
+        self.assertEqual(store.load_runtime(), snapshot)
+
     def test_cycle_focus_starts_are_ordered_and_bounded_to_ninety_nine(self) -> None:
         store = SQLiteStore(":memory:")
         self.addCleanup(store.close)
@@ -236,6 +272,7 @@ class SQLiteStoreTest(unittest.TestCase):
         )
 
         self.assertEqual(store.load_cycle_focus_starts(), tuple(range(1, 100)))
+        self.assertEqual(store.load_cycle_focus_intervals(), ())
 
     def test_cycle_focus_history_replacement_is_atomic_with_stats_and_runtime(self) -> None:
         store = SQLiteStore(":memory:")
@@ -249,7 +286,7 @@ class SQLiteStoreTest(unittest.TestCase):
         store.commit(
             original,
             {"2026-06-01": 1_000},
-            recent_cycle_focus_starts=(100,),
+            recent_cycle_focus_intervals=((100, 200),),
         )
         store.connection.execute(
             """
@@ -271,14 +308,15 @@ class SQLiteStoreTest(unittest.TestCase):
                     break_kind=BreakKind.SHORT,
                     phase_total_ms=10_000,
                     break_deadline_wall_ms=900,
+                    long_break_recommended=True,
                 ),
                 {"2026-06-01": 2_000},
-                recent_cycle_focus_starts=(400,),
+                recent_cycle_focus_intervals=((400, 500),),
             )
 
         self.assertEqual(store.load_runtime(), original)
         self.assertEqual(store.stats_for_day("2026-06-01").focus_ms, 1_000)
-        self.assertEqual(store.load_cycle_focus_starts(), (100,))
+        self.assertEqual(store.load_cycle_focus_intervals(), ((100, 200),))
 
 
 if __name__ == "__main__":

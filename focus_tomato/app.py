@@ -96,6 +96,11 @@ _REST_SCREEN_CSS = b"""
     font-size: 20px;
 }
 
+.focus-tomato-rest-screen .rest-long-break-hint {
+    color: rgba(255, 255, 255, 0.34);
+    font-size: 14px;
+}
+
 .focus-tomato-rest-screen .focus-ready-button {
     background-image: none;
     background-color: rgba(0, 0, 0, 0.16);
@@ -162,6 +167,7 @@ class FocusTomatoApplication(Gtk.Application):
         self._rest_screen_focus_content: Gtk.Box | None = None
         self._rest_screen_countdown: Gtk.Label | None = None
         self._rest_screen_stats: Gtk.Label | None = None
+        self._rest_screen_long_break_hint: Gtk.Label | None = None
         self._rest_screen_focus_countdown: Gtk.Label | None = None
         self._rest_screen_focus_hint: Gtk.Label | None = None
         self._rest_screen_focus_button: Gtk.Button | None = None
@@ -332,8 +338,12 @@ class FocusTomatoApplication(Gtk.Application):
         stats.set_xalign(0.5)
         stats.set_valign(Gtk.Align.CENTER)
         stats.get_style_context().add_class("rest-stats")
+        long_break_hint = Gtk.Label()
+        long_break_hint.set_xalign(0.5)
+        long_break_hint.get_style_context().add_class("rest-long-break-hint")
         break_content.pack_start(countdown, False, False, 0)
         break_content.pack_start(stats, False, False, 0)
+        break_content.pack_start(long_break_hint, False, False, 0)
         content.pack_start(break_content, False, False, 0)
 
         focus_content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
@@ -353,7 +363,7 @@ class FocusTomatoApplication(Gtk.Application):
         lower_slot_size_group.add_widget(start_button)
 
         focus_hint = Gtk.Label(
-            label="输入分钟数 · ↑↓ ±1分钟 · ←→ ±5分钟 · Enter 开始 · Esc 退出"
+            label="输入分钟数 · ←→ ±1分钟 · ↑↓ ±5分钟 · Enter 开始 · Esc 退出"
         )
         focus_hint.set_halign(Gtk.Align.CENTER)
         focus_hint.set_valign(Gtk.Align.END)
@@ -376,6 +386,7 @@ class FocusTomatoApplication(Gtk.Application):
         self._rest_screen_focus_content = focus_content
         self._rest_screen_countdown = countdown
         self._rest_screen_stats = stats
+        self._rest_screen_long_break_hint = long_break_hint
         self._rest_screen_focus_countdown = focus_countdown
         self._rest_screen_focus_hint = focus_hint
         self._rest_screen_focus_button = start_button
@@ -405,8 +416,6 @@ class FocusTomatoApplication(Gtk.Application):
         style_context = self._rest_screen_background.get_style_context()
         style_context.remove_class("long-break")
         style_context.remove_class("focus-ready")
-        if snapshot.break_kind is BreakKind.LONG:
-            style_context.add_class("long-break")
         self._rest_screen_focus_content.hide()
         self._rest_screen_focus_hint.hide()
         self._rest_screen_break_content.show()
@@ -532,12 +541,22 @@ class FocusTomatoApplication(Gtk.Application):
             return
         assert self._rest_screen_countdown is not None
         assert self._rest_screen_stats is not None
+        assert self._rest_screen_long_break_hint is not None
         assert self.engine is not None
         self._rest_screen_countdown.set_text(_format_remaining(snapshot.remaining_ms))
         stats = self.engine.today_stats()
         self._rest_screen_stats.set_text(
             f"今日 {stats.completed_sessions} 次 · {_format_duration(stats.focus_ms)}"
         )
+        if snapshot.long_break_recommended:
+            suggested_minutes = self.engine.config.long_break_seconds // 60
+            required_sessions = self.engine.config.sessions_before_long_break
+            self._rest_screen_long_break_hint.set_text(
+                f"已连续完成 {required_sessions} 次专注，可以考虑休息 {suggested_minutes} 分钟"
+            )
+            self._rest_screen_long_break_hint.show()
+        else:
+            self._rest_screen_long_break_hint.hide()
 
     def _rest_screen_is_visible(self) -> bool:
         return self._rest_screen is not None and self._rest_screen.get_visible()
@@ -576,6 +595,24 @@ class FocusTomatoApplication(Gtk.Application):
         event: Gdk.EventKey,
     ) -> bool:
         if self._rest_screen_page == _REST_SCREEN_BREAK:
+            control_pressed = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+            if event.keyval == Gdk.KEY_space and control_pressed:
+                return True
+            adjustments = {
+                Gdk.KEY_Right: 1,
+                Gdk.KEY_Left: -1,
+                Gdk.KEY_Up: 5,
+                Gdk.KEY_Down: -5,
+                Gdk.KEY_space: 1,
+            }
+            adjustment = adjustments.get(event.keyval)
+            if adjustment is not None and not control_pressed:
+                assert self.engine is not None
+                self._handle_events(
+                    self.engine.adjust_break_minutes(adjustment)
+                )
+                self._render()
+                return True
             if event.keyval not in _MODIFIER_KEYVALS:
                 self._close_rest_screen()
                 return True
@@ -591,10 +628,10 @@ class FocusTomatoApplication(Gtk.Application):
             self._close_rest_screen()
             return True
         adjustments = {
-            Gdk.KEY_Up: 1,
-            Gdk.KEY_Down: -1,
-            Gdk.KEY_Right: 5,
-            Gdk.KEY_Left: -5,
+            Gdk.KEY_Right: 1,
+            Gdk.KEY_Left: -1,
+            Gdk.KEY_Up: 5,
+            Gdk.KEY_Down: -5,
         }
         adjustment = adjustments.get(keyval)
         if adjustment is not None:
@@ -828,17 +865,17 @@ class FocusTomatoApplication(Gtk.Application):
             if event is TimerEvent.FOCUS_COMPLETED:
                 assert self.engine is not None
                 snapshot = self.engine.snapshot
-                label = "长休息" if snapshot.break_kind is BreakKind.LONG else "休息"
                 self._notify(
                     "专注完成",
-                    f"做得好，现在开始{label}。",
-                    default_action=self._show_rest_screen,
+                    f"做得好，点击开始 {_format_duration(snapshot.remaining_ms)}休息。",
+                    default_action=self._start_pending_break,
                 )
             elif event is TimerEvent.FOCUS_ENDED_EARLY:
+                assert self.engine is not None
                 self._notify(
                     "专注提前结束",
-                    "已记录实际专注时长，现在开始缩短休息。",
-                    default_action=self._show_rest_screen,
+                    "已记录实际专注时长，点击开始缩短休息。",
+                    default_action=self._start_pending_break,
                 )
             elif event is TimerEvent.BREAK_COMPLETED:
                 if self._rest_screen_is_visible():
@@ -866,7 +903,7 @@ class FocusTomatoApplication(Gtk.Application):
 
             notification.add_action(
                 "default",
-                "进入休息",
+                "开始休息",
                 activate_default_action,
                 None,
             )
@@ -883,6 +920,22 @@ class FocusTomatoApplication(Gtk.Application):
         except ValueError:
             pass
 
+    def _close_active_notifications(self) -> None:
+        notifications = tuple(self._active_notifications)
+        self._active_notifications.clear()
+        for notification in notifications:
+            try:
+                notification.close()
+            except GLib.Error:
+                pass
+
+    def _start_pending_break(self) -> None:
+        if self.engine is None or not self.engine.start_break():
+            return
+        self._close_active_notifications()
+        self._show_rest_screen()
+        self._render()
+
     def _render(self) -> None:
         if self.engine is None or self.indicator is None:
             return
@@ -891,12 +944,14 @@ class FocusTomatoApplication(Gtk.Application):
             TimerStatus.IDLE: "等待开始",
             TimerStatus.FOCUS_RUNNING: f"专注中 · {_format_remaining(snapshot.remaining_ms)}",
             TimerStatus.FOCUS_PAUSED: f"专注已暂停 · {_format_remaining(snapshot.remaining_ms)}",
+            TimerStatus.BREAK_READY: f"等待休息 · {_format_remaining(snapshot.remaining_ms)}",
             TimerStatus.BREAK_RUNNING: f"休息中 · {_format_remaining(snapshot.remaining_ms)}",
         }
         icons = {
             TimerStatus.IDLE: "focus-tomato-idle-symbolic",
             TimerStatus.FOCUS_RUNNING: "focus-tomato-focus-symbolic",
             TimerStatus.FOCUS_PAUSED: "focus-tomato-paused-symbolic",
+            TimerStatus.BREAK_READY: "focus-tomato-break-symbolic",
             TimerStatus.BREAK_RUNNING: "focus-tomato-break-symbolic",
         }
         assert self.status_item is not None
@@ -925,13 +980,18 @@ class FocusTomatoApplication(Gtk.Application):
             self.primary_item.show()
             self.secondary_item.set_label("提前结束专注")
             self.secondary_item.show()
+        elif snapshot.status is TimerStatus.BREAK_READY:
+            self.primary_item.set_label("开始休息")
+            self.primary_item.show()
+            self.secondary_item.set_label("跳过休息")
+            self.secondary_item.show()
         elif snapshot.status is TimerStatus.BREAK_RUNNING:
             self.primary_item.hide()
             self.secondary_item.set_label("结束休息")
             self.secondary_item.show()
 
         if (
-            snapshot.status is not TimerStatus.IDLE
+            snapshot.status.is_running
             and snapshot.remaining_ms <= self.engine.config.countdown_visible_seconds * 1000
         ):
             self.indicator.set_label(_format_remaining(snapshot.remaining_ms), "00:00")
@@ -980,12 +1040,18 @@ class FocusTomatoApplication(Gtk.Application):
             self._handle_events(self.engine.pause_focus())
         elif status is TimerStatus.FOCUS_PAUSED:
             self.engine.resume()
+        elif status is TimerStatus.BREAK_READY:
+            self._start_pending_break()
+            return
         self._render()
 
     def _on_secondary(self, _item: Gtk.MenuItem) -> None:
         assert self.engine is not None
         if self.engine.snapshot.status.is_focus:
             self._handle_events(self.engine.end_focus())
+        elif self.engine.snapshot.status is TimerStatus.BREAK_READY:
+            if self.engine.skip_break():
+                self._close_active_notifications()
         elif self.engine.snapshot.status.is_break:
             self._handle_events(self.engine.end_break())
             # Manually ending a rest returns to idle; only a naturally elapsed

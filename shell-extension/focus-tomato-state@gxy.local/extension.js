@@ -179,6 +179,7 @@ class FocusTomatoStateBandExtension {
             'idle',
             'focus_running',
             'focus_paused',
+            'break_ready',
             'break_running',
             'break_paused',
         ];

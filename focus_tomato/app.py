@@ -262,17 +262,10 @@ class FocusTomatoApplication(Gtk.Application):
         self._render()
 
     def do_activate(self) -> None:
-        # Manual launches are a deliberate entry into the full-screen launch
-        # surface.  Login autostart must remain quiet in the panel.
+        # Application activation only exposes the panel indicator. Opening the
+        # focus launch surface remains an explicit action from its menu.
         if self.indicator is not None:
             self.indicator.set_status(AyatanaAppIndicator3.IndicatorStatus.ACTIVE)
-        if self.autostart_launch or self.engine is None:
-            return
-        status = self.engine.snapshot.status
-        if status is TimerStatus.IDLE:
-            self._show_focus_ready_screen()
-        elif status.is_break:
-            self._show_rest_screen()
 
     def _icon_dir(self) -> str:
         configured = os.environ.get("FOCUS_TOMATO_ICON_DIR")
